@@ -22,7 +22,7 @@ from app.ai import client as ai_client
 from app.feishu import (bot, start_bot, stop_bot, bot_status, get_news)
 from app.feishu_deviceflow import FeishuDeviceFlow
 from app.agent.router import agent_router, MessagePayload
-from app.skills.store import JsonStore
+from app.skills.db_store import PgStore, init_db
 
 # ===== 鉴权白名单（03-OTP：勿扩大）=====
 PUBLIC_EXACT = {"/api/health"}
@@ -66,6 +66,8 @@ def _login_fail_reset(ip: str) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 启动：PostgreSQL 表就绪（DB_URL 未配置则跳过）
+    await init_db()
     # 启动：若飞书已启用且有凭据，拉起 WS Bot
     loop = asyncio.get_running_loop()
     if settings.feishu_enabled and settings.feishu_app_id and settings.feishu_app_secret:
@@ -284,9 +286,9 @@ async def agent_chat(req: ChatReq):
     return {"reply": reply}
 
 
-# ===== 待办 / 收支 REST（前后端共用 JsonStore，按单用户实例隔离）=====
-_todo_store = JsonStore("todo")
-_expense_store = JsonStore("expense")
+# ===== 待办 / 收支 REST（前后端共用 PgStore，按单用户实例隔离）=====
+_todo_store = PgStore("todo")
+_expense_store = PgStore("expense")
 DEFAULT_USER = "me"
 
 

@@ -1,14 +1,14 @@
 """待办/任务技能 handler：自然语言增删查改。
 
 仅做个人待办管理；无法识别的语句返回 None，交给 router 的默认 AI 对话（不卡死）。
-数据走 app.skills.store.JsonStore（data/skill_todo.json，按 user_id 隔离）。
+数据走 app.skills.db_store.PgStore（PostgreSQL todos 表，按 user_id 隔离）。
 """
 import re
 import time
 
-from app.skills.store import JsonStore
+from app.skills.db_store import PgStore
 
-store = JsonStore("todo")
+store = PgStore("todo")
 
 _ADD_RE = re.compile(r"^(?:添加|新增|新建|记一下|记一个|提醒我|帮我记|加个?|待办[：: ]?|任务[：: ]?)\s*(.*)$")
 _DONE_RE = re.compile(r"(?:完成|做完|搞定|已做|已经做|标记完成)\s*(.*)$")

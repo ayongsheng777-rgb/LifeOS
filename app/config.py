@@ -71,6 +71,7 @@ class Settings:
     redis_url: str = "redis://redis:6379/0"
     qdrant_url: str = "http://qdrant:6333"
     data_dir: str = "./data"
+    db_url: str = ""   # Phase 1：PostgreSQL 连接串（postgresql+asyncpg://user:pw@host:port/db）；留空则待办/收支不可用
 
     # ---- AI（OpenAI 兼容）----
     ai_enabled: bool = False
@@ -102,6 +103,7 @@ class Settings:
         self.redis_url = os.environ.get("REDIS_URL", self.redis_url)
         self.qdrant_url = os.environ.get("QDRANT_URL", self.qdrant_url)
         self.data_dir = os.environ.get("DATA_DIR", self.data_dir)
+        self.db_url = os.environ.get("DB_URL", self.db_url)
 
         self.ai_enabled = os.environ.get("AI_ENABLED", "false").lower() in ("1", "true", "yes", "on")
         self.ai_base_url = os.environ.get("AI_BASE_URL", self.ai_base_url)

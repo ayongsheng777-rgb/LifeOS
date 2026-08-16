@@ -4,15 +4,15 @@
 - 含「花了多少/这个月/账单」类词 → 月度汇总
 - 金额缺失或无关 → 返回 None 交给默认 AI（不卡死）
 
-数据走 app.skills.store.JsonStore（data/skill_expense.json，按 user_id 隔离）。
+数据走 app.skills.db_store.PgStore（PostgreSQL expenses 表，按 user_id 隔离）。
 类目提取为启发式，可能不精准，可经 REST 端点显式指定。
 """
 import re
 import time
 
-from app.skills.store import JsonStore
+from app.skills.db_store import PgStore
 
-store = JsonStore("expense")
+store = PgStore("expense")
 
 _AMOUNT_RE = re.compile(r"(\d+(?:\.\d+)?)")
 _INCOME_KW = ("收入", "入账", "工资", "赚", "进账", "收款", "报销", "回款", "分红")

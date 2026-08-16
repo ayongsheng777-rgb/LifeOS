@@ -1,6 +1,5 @@
 # ===== LifeOS V2.0 Docker Compose（生产部署）=====
-# 数据卷用本地目录挂载，容器销毁/重装不丢“人生资产”
-version: '3.8'
+# 数据卷用命名卷/本地目录挂载，容器销毁/重装不丢“人生资产”
 
 services:
   lifeos-api:
@@ -27,11 +26,14 @@ services:
       - FEISHU_APP_ID=${FEISHU_APP_ID:-}
       - FEISHU_APP_SECRET=${FEISHU_APP_SECRET:-}
       - FEISHU_ENABLED=${FEISHU_ENABLED:-false}
+      # ===== Phase 1：PostgreSQL 数据层（独立库/用户/密码，默认经 .env 的 LIFEOS_DB_PW 覆盖）=====
+      - DB_URL=postgresql+asyncpg://lifeos:${LIFEOS_DB_PW:-lifeos_pg_2026}@postgres:5432/lifeos
       # 前端 SPA 与 API 同源托管（FRONTEND_DIST 指向构建产物）
       - FRONTEND_DIST=/app/frontend/dist
     depends_on:
       - redis
       - qdrant
+      - postgres
     volumes:
       - ./app:/app/app
       - ./skills:/app/skills
@@ -56,3 +58,22 @@ services:
     volumes:
       - ./qdrantdata:/qdrant/storage
     restart: always
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: lifeos-postgres
+    # 宿主 5433 → 容器 5432（避开本机其它项目已占用的 5436~5442）
+    ports:
+      - "5433:5432"
+    environment:
+      - POSTGRES_USER=lifeos
+      - POSTGRES_PASSWORD=${LIFEOS_DB_PW:-lifeos_pg_2026}
+      - POSTGRES_DB=lifeos
+    # 用命名卷而非 bind mount：避免 Windows 宿主目录权限不符 Postgres(0700) 要求导致崩溃循环
+    volumes:
+      - lifeos_pgdata:/var/lib/postgresql/data
+    restart: always
+
+# ===== 命名卷（数据持久化，由 Docker 管理权限，避免 PG 初始化权限错误）=====
+volumes:
+  lifeos_pgdata:
