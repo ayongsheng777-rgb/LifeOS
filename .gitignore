@@ -26,6 +26,9 @@ qdrantdata/
 frontend/node_modules/
 frontend/dist/
 
+# ===== 运行时日志（宿主实例 stdout 重定向，本地保留即可）=====
+.lifeos_run.log
+
 # ===== 编辑器/系统 =====
 .idea/
 .vscode/

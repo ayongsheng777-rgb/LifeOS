@@ -99,6 +99,36 @@ class UsageStore:
         return {"calls": 0, "ok": 0, "fail": 0, "input_tokens": 0,
                 "output_tokens": 0, "total_tokens": 0, "cost": 0.0, "per_model": {}}
 
+    async def daily_summary(self, user_id: str, days: int = 14) -> list:
+        """按天聚合用量（近 N 天），用于趋势图。DB 不可用时返回空列表。"""
+        try:
+            sm = get_sessionmaker()
+        except RuntimeError:
+            return []
+        try:
+            since = int(time.time()) - days * 86400
+            async with sm() as s:
+                res = await s.execute(
+                    select(AIUsage).where(AIUsage.user_id == user_id, AIUsage.created_at >= since)
+                )
+                rows = res.scalars().all()
+            by_day: dict = {}
+            for r in rows:
+                day = time.strftime("%Y-%m-%d", time.localtime(r.created_at))
+                d = by_day.setdefault(day, {"date": day, "calls": 0, "tokens": 0,
+                                            "cost": 0.0, "ok": 0, "fail": 0})
+                d["calls"] += 1
+                d["tokens"] += int(r.input_tokens or 0) + int(r.output_tokens or 0)
+                d["cost"] = round(d["cost"] + float(r.cost or 0), 6)
+                if r.ok:
+                    d["ok"] += 1
+                else:
+                    d["fail"] += 1
+            return [by_day[d] for d in sorted(by_day)]
+        except Exception as e:
+            log.warning("ai_usage 按天汇总失败（忽略）: %s", e)
+            return []
+
     async def summary(self, user_id: str, since_ts: int = None) -> dict:
         """汇总某用户用量；DB 不可用时返回空结构。"""
         try:

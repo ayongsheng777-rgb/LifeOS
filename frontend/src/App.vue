@@ -4,6 +4,7 @@
     <aside class="side">
       <div class="brand">LifeOS</div>
       <nav>
+        <button class="nav" :class="{ active: tab === 'dashboard' }" @click="tab = 'dashboard'">📊 概览</button>
         <button class="nav" :class="{ active: tab === 'chat' }" @click="tab = 'chat'">💬 对话</button>
         <button class="nav" :class="{ active: tab === 'todo' }" @click="tab = 'todo'">✅ 待办</button>
         <button class="nav" :class="{ active: tab === 'expense' }" @click="tab = 'expense'">💰 记账</button>
@@ -16,7 +17,8 @@
       </div>
     </aside>
     <main class="main scroll">
-      <Chat v-if="tab === 'chat'" />
+      <Dashboard v-if="tab === 'dashboard'" />
+      <Chat v-else-if="tab === 'chat'" />
       <Todo v-else-if="tab === 'todo'" />
       <Expense v-else-if="tab === 'expense'" />
       <News v-else-if="tab === 'news'" />
@@ -30,6 +32,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { getToken, clearToken, api } from './api.js'
 import Login from './components/Login.vue'
+import Dashboard from './components/Dashboard.vue'
 import Chat from './components/Chat.vue'
 import Todo from './components/Todo.vue'
 import Expense from './components/Expense.vue'

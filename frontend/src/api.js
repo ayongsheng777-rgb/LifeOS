@@ -97,4 +97,13 @@ export const api = {
   feishuStatusInfo: () => request('GET', '/api/feishu/status'),
   feishuDisconnect: () => request('POST', '/api/feishu/disconnect'),
   feishuBotStart: () => request('POST', '/api/feishu/bot-start'),
+
+  // 概览 / Dashboard
+  aiUsage: () => request('GET', '/api/ai/usage'),
+  aiUsageDaily: (days = 14) =>
+    request('GET', '/api/ai/usage/daily' + (qs({ days }) ? '?' + qs({ days }) : '')),
+  skillsStats: () => request('GET', '/api/skills/stats'),
+  memoryShort: () => request('GET', '/api/memory/short'),
+  memoryLong: (limit = 50) =>
+    request('GET', '/api/memory/long' + (qs({ limit }) ? '?' + qs({ limit }) : '')),
 }

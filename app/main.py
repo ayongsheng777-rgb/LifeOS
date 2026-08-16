@@ -360,6 +360,28 @@ async def ai_usage():
     return summary
 
 
+@app.get("/api/ai/usage/daily")
+async def ai_usage_daily(days: int = Query(14, ge=1, le=90)):
+    """近 N 天按天用量趋势（Dashboard 趋势图用）。"""
+    return {"days": days, "daily": await usage_store.daily_summary(DEFAULT_USER, days=days)}
+
+
+@app.get("/api/skills/stats")
+async def skills_stats():
+    """技能列表 + 命中计数 + 最近意图/技能（Dashboard 技能热度用）。"""
+    skills = agent_router.skill_registry.get_available_skills()
+    hits = agent_router.memory.skill_hits
+    working = agent_router.memory.get_working(DEFAULT_USER)
+    return {
+        "skills": [
+            {"name": s["name"], "desc": s.get("desc"), "hits": hits.get(s["name"], 0)}
+            for s in skills
+        ],
+        "last_intent": working.get("last_intent"),
+        "last_skill": working.get("last_skill"),
+    }
+
+
 @app.post("/api/agent/chat/stream")
 async def agent_chat_stream(req: ChatReq):
     """SSE 流式对话：逐块返回文本（打字机效果）。skill/multi_step 走非流式整段返回。"""

@@ -41,6 +41,7 @@ class MemoryManager:
         self.working = WorkingMemory()
         self.short = ShortMemory()
         self.long = None  # 长期记忆懒加载；不可用时置 False（哨兵），避免反复重试
+        self.skill_hits = {}  # 技能命中计数（进程内，重启归零；个人实例足够）
 
     # ===================== 工作记忆 =====================
     def set_working(self, user_id: str, key: str, value) -> None:
@@ -51,6 +52,11 @@ class MemoryManager:
 
     def clear_working(self, user_id: str) -> None:
         self.working.clear(user_id)
+
+    # ===================== 技能命中统计 =====================
+    def bump_skill(self, name: str) -> None:
+        """技能被实际分发执行时自增计数（供 Dashboard 展示命中热度）。"""
+        self.skill_hits[name] = self.skill_hits.get(name, 0) + 1
 
     # ===================== 短期记忆 =====================
     def get_short(self, user_id: str) -> list:

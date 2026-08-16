@@ -82,11 +82,13 @@ class AgentRouter:
 
         # 5. 分发执行
         if decision["type"] == "skill" and self.skill_registry.has_skill(decision["skill"]):
-            skill = self.skill_registry.get_skill(decision["skill"])
+            skill_name = decision["skill"]
+            self.memory.bump_skill(skill_name)
+            skill = self.skill_registry.get_skill(skill_name)
             try:
                 response = await skill.execute(message, context, user_id=user_id)
             except Exception as e:
-                response = f"技能[{decision['skill']}]执行出错：{e}"
+                response = f"技能[{skill_name}]执行出错：{e}"
             # 技能返回 None → 交给 AI 默认对话（不卡死）
             if response is None:
                 response = await self._default_chat(message, context, user_id=user_id)
@@ -293,11 +295,13 @@ class AgentRouter:
 
         # 3. 分发
         if decision["type"] == "skill" and self.skill_registry.has_skill(decision["skill"]):
-            skill = self.skill_registry.get_skill(decision["skill"])
+            skill_name = decision["skill"]
+            self.memory.bump_skill(skill_name)
+            skill = self.skill_registry.get_skill(skill_name)
             try:
                 response = await skill.execute(message, context, user_id=user_id)
             except Exception as e:
-                response = f"技能[{decision['skill']}]执行出错：{e}"
+                response = f"技能[{skill_name}]执行出错：{e}"
             if response is None:
                 response = await self._default_chat(message, context, user_id=user_id)
             yield response
