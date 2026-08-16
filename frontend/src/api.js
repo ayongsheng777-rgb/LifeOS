@@ -39,13 +39,22 @@ const qs = (obj) => Object.entries(obj || {})
 export const api = {
   // 鉴权
   // /api/auth/setup 在「已绑定」时返回 403 {setup_open:false}，属正常态，不抛错
-  setup: async () => {
+  // 若服务器开启 LIFEOS_SETUP_TOKEN 保护，未带令牌返回 403 SETUP_TOKEN_REQUIRED
+  setup: async (setupToken) => {
     const headers = {}
     const t = getToken()
     if (t) headers['Authorization'] = 'Bearer ' + t
-    const resp = await fetch('/api/auth/setup', { headers })
+    let url = '/api/auth/setup'
+    if (setupToken) url += '?token=' + encodeURIComponent(setupToken)
+    const resp = await fetch(url, { headers })
     if (resp.status === 403) {
-      return await resp.json().catch(() => ({ setup_open: false }))
+      const data = await resp.json().catch(() => ({}))
+      if (data.code === 'SETUP_TOKEN_REQUIRED') {
+        const e = new Error('需要初始化令牌')
+        e.code = 'SETUP_TOKEN_REQUIRED'
+        throw e
+      }
+      return { setup_open: false }
     }
     if (resp.status === 401) {
       clearToken()

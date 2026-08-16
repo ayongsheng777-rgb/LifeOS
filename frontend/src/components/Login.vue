@@ -10,6 +10,12 @@
         <!-- 首次绑定：展示密钥二维码 -->
         <div v-if="setupOpen" class="bind">
           <p>首次使用，请用 <b>Google 验证器 / 1Password / Authy</b> 扫码绑定：</p>
+          <div v-if="needSetupToken" class="token-box">
+            <label>初始化令牌（服务器已开启 SETUP_TOKEN 保护）</label>
+            <input v-model="setupToken" placeholder="请输入 LIFEOS_SETUP_TOKEN" @keyup.enter="confirmToken" />
+            <button class="ghost" :disabled="!setupToken" @click="confirmToken">确认令牌</button>
+            <p v-if="tokenErr" class="error">{{ tokenErr }}</p>
+          </div>
           <div class="qr-box">
             <img v-if="qr" :src="qr" class="qr-img" alt="OTP 绑定二维码" />
             <div v-else class="empty">无法生成二维码</div>
@@ -55,10 +61,13 @@ const secret = ref('')
 const otp = ref('')
 const busy = ref(false)
 const err = ref('')
+const setupToken = ref('')
+const needSetupToken = ref(false)
+const tokenErr = ref('')
 
-onMounted(async () => {
+async function loadSetup(token) {
   try {
-    const info = await api.setup()
+    const info = await api.setup(token)
     setupOpen.value = !!info.setup_open
     if (info.setup_open) {
       secret.value = info.secret || ''
@@ -75,10 +84,25 @@ onMounted(async () => {
       }
     }
   } catch (e) {
+    if (e.code === 'SETUP_TOKEN_REQUIRED') {
+      needSetupToken.value = true
+      setupOpen.value = true
+      tokenErr.value = ''
+      return
+    }
     err.value = e.message
-  } finally {
-    loading.value = false
   }
+}
+
+async function confirmToken() {
+  tokenErr.value = ''
+  if (!setupToken.value) { tokenErr.value = '请输入初始化令牌'; return }
+  await loadSetup(setupToken.value)
+}
+
+onMounted(async () => {
+  await loadSetup()
+  loading.value = false
 })
 
 async function submit() {

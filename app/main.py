@@ -7,6 +7,7 @@
 import os
 import asyncio
 import time
+import hmac
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -26,6 +27,41 @@ from app.skills.store import JsonStore
 # ===== 鉴权白名单（03-OTP：勿扩大）=====
 PUBLIC_EXACT = {"/api/health"}
 PUBLIC_PREFIXES = ("/api/auth/",)
+
+
+# ===== 登录暴力破解防护（P0-02，单进程内存限流；Redis 起后可升级为共享限流）=====
+_login_fail: dict = {}  # ip -> {"count": int, "lock_until": float}
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _login_allowed(ip: str) -> bool:
+    rec = _login_fail.get(ip)
+    if not rec:
+        return True
+    return rec["lock_until"] <= time.time()
+
+
+def _login_fail_inc(ip: str) -> None:
+    rec = _login_fail.get(ip, {"count": 0, "lock_until": 0.0})
+    rec["count"] += 1
+    # 5 次→锁 30s；10 次→锁 300s；20+ 次→锁 1800s（指数退避）
+    if rec["count"] >= 20:
+        rec["lock_until"] = time.time() + 1800
+    elif rec["count"] >= 10:
+        rec["lock_until"] = time.time() + 300
+    elif rec["count"] >= 5:
+        rec["lock_until"] = time.time() + 30
+    _login_fail[ip] = rec
+
+
+def _login_fail_reset(ip: str) -> None:
+    _login_fail.pop(ip, None)
 
 
 @asynccontextmanager
@@ -65,6 +101,20 @@ async def auth_guard(request: Request, call_next):
     )
 
 
+# ===== 安全响应头（P0-03：CSP 等，降低 XSS/点击劫持面）=====
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; object-src 'none'; frame-ancestors 'none'",
+    )
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    return resp
+
+
 # ===== CORS（放在 auth_guard 之后注册，使其为最外层，优先处理预检）=====
 # 同源（SPA 由本服务托管）无需跨域；以下为本地开发（vite :5173）与隧道域名放行
 app.add_middleware(
@@ -85,14 +135,15 @@ app.add_middleware(
 # ===== 健康检查 =====
 @app.get("/api/health")
 async def health():
+    # #30 信息脱敏：不暴露内部基础设施地址，仅返回依赖可用性摘要
     return {
         "status": "ok",
         "ai_available": ai_client.available(),
         "feishu": bot_status(),
-        "memory": {
-            "short_term_redis": settings.redis_url,
-            "long_term_qdrant": settings.qdrant_url,
-            "embedding_model": settings.embedding_model,
+        "dependencies": {
+            "redis": "configured" if settings.redis_url else "not_configured",
+            "qdrant": "configured" if settings.qdrant_url else "not_configured",
+            "embedding": "configured" if settings.embedding_model else "not_configured",
         },
     }
 
@@ -107,25 +158,39 @@ class ResetReq(BaseModel):
 
 
 @app.get("/api/auth/setup")
-async def auth_setup():
+async def auth_setup(request: Request):
     if not auth.is_setup_open():
         return JSONResponse(status_code=403, content={"setup_open": False})
-    info = auth.setup_info()
-    # 脱敏：secret 仅展示一次（setup_open 时允许展示）；otpauth_uri 含 secret，前端用后即焚
-    return info
+    # P0-01：设了 LIFEOS_SETUP_TOKEN 后，未绑定期必须带令牌，禁止公网匿名拿 secret
+    setup_token = os.environ.get("LIFEOS_SETUP_TOKEN", "")
+    if setup_token:
+        provided = request.query_params.get("token", "") or request.headers.get("X-Setup-Token", "")
+        if not hmac.compare_digest(provided, setup_token):
+            return JSONResponse(status_code=403,
+                                content={"error": "需要有效的初始化令牌", "code": "SETUP_TOKEN_REQUIRED"})
+    return auth.setup_info()
 
 
 @app.post("/api/auth/login")
-async def auth_login(req: LoginReq):
+async def auth_login(req: LoginReq, request: Request):
+    ip = _client_ip(request)
+    if not _login_allowed(ip):
+        return JSONResponse(status_code=429,
+                            content={"error": "尝试过于频繁，请稍后再试", "code": "LOGIN_LOCKED"},
+                            headers={"Retry-After": "30"})
     result = auth.login(req.otp)
     if not result:
+        _login_fail_inc(ip)
         return JSONResponse(status_code=401, content={"error": "动态码错误", "code": "OTP_INVALID"})
+    _login_fail_reset(ip)
     return result
 
 
 @app.get("/api/auth/check")
-async def auth_check():
-    return {"authed": False, "setup_open": auth.is_setup_open()}
+async def auth_check(authorization: Optional[str] = Header(None)):
+    token = authorization[7:].strip() if authorization and authorization.lower().startswith("bearer ") else ""
+    authed = bool(token) and auth.verify_token(token)
+    return {"authed": authed, "setup_open": auth.is_setup_open()}
 
 
 @app.post("/api/auth/logout")
@@ -207,14 +272,14 @@ async def feishu_news():
 
 # ===== 调试/本地入口：直接对话 Agent（受 Bearer 保护）=====
 class ChatReq(BaseModel):
-    user_id: str = "debug"
     message: str
 
 
 @app.post("/api/agent/chat")
 async def agent_chat(req: ChatReq):
+    # P0-04：外部 REST 不再接受客户端自填 user_id，统一用单用户身份 "me"
     reply = await agent_router.process_message(
-        MessagePayload(user_id=req.user_id, message=req.message, source="debug",
+        MessagePayload(user_id="me", message=req.message, source="debug",
                        time=str(int(time.time()))))
     return {"reply": reply}
 
