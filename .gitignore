@@ -1,0 +1,32 @@
+# ===== 密钥 / 运行时隐私数据，绝不提交 =====
+data/
+*.secret
+*.enrolled
+session_secret
+otp_secret
+.env
+.env.local
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.deps/
+.smoke_data/
+
+# ===== 容器数据卷（人生资产，本地保留即可）=====
+pgdata/
+redisdata/
+qdrantdata/
+
+# ===== 前端构建产物 / 依赖（本地磁盘保留，供宿主服务读取 dist）=====
+frontend/node_modules/
+frontend/dist/
+
+# ===== 编辑器/系统 =====
+.idea/
+.vscode/
+.DS_Store

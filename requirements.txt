@@ -1,0 +1,13 @@
+# ===== LifeOS V2.0 依赖（强锁版本；禁用 latest）=====
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+redis==5.2.1
+qdrant-client==1.12.1
+pyyaml==6.0.2
+httpx==0.28.1
+python-dotenv==1.0.1
+# 飞书 WS 长连接 Bot（设备授权流仅依赖 httpx）
+lark-oapi>=1.0.6
+# OTP 本地二维码（纯 Python，绝不用在线服务）
+segno>=1.6.1

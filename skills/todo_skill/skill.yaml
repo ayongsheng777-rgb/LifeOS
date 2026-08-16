@@ -1,0 +1,10 @@
+name: todo_skill
+description: 待办/任务管理（增删查改、完成、提醒），支持自然语言
+trigger_keywords:
+  - 待办
+  - 任务
+  - todo
+  - 提醒我
+  - 记一下
+  - 待办事项
+  - 待办列表

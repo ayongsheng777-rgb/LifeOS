@@ -1,0 +1,10 @@
+name: news_skill
+description: 新闻摘要与资讯整理（汇总已摄入的新闻素材，结合 AI 生成今日摘要）
+trigger_keywords:
+  - 新闻
+  - 资讯
+  - 摘要
+  - 素材
+  - news
+  - 今天有什么新闻
+  - 看了什么新闻

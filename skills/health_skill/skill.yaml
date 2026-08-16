@@ -1,0 +1,7 @@
+name: health_skill
+description: 健康记录与提醒（不适/用药关键词触发），仅做信息整理，非诊断
+trigger_keywords:
+  - 不舒服
+  - 药
+  - 症状
+  - 身体

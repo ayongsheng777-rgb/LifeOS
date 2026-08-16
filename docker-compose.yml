@@ -1,0 +1,58 @@
+# ===== LifeOS V2.0 Docker Compose（生产部署）=====
+# 数据卷用本地目录挂载，容器销毁/重装不丢“人生资产”
+version: '3.8'
+
+services:
+  lifeos-api:
+    build: .
+    container_name: lifeos-api
+    ports:
+      # 外部 7208 = Cloudflare Tunnel 目标
+      # lifeos.yshost.de5.net → http://192.168.59.56:7208（cloudflared 经宿主机 IP 访问）
+      - "7208:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
+      - DATA_DIR=/app/data
+      - AI_ENABLED=${AI_ENABLED:-false}
+      - AI_BASE_URL=${AI_BASE_URL:-https://api.deepseek.com/v1}
+      - AI_API_KEY=${AI_API_KEY:-}
+      - AI_MODEL=${AI_MODEL:-deepseek-chat}
+      - AI_PROXY=${AI_PROXY:-}
+      - OTP_ISSUER=${OTP_ISSUER:-LifeOS}
+      - OTP_ACCOUNT=${OTP_ACCOUNT:-admin@lifeos}
+      - SESSION_TTL=${SESSION_TTL:-43200}
+      - OTP_SECRET=${OTP_SECRET:-}
+      - SESSION_SECRET=${SESSION_SECRET:-}
+      - FEISHU_APP_ID=${FEISHU_APP_ID:-}
+      - FEISHU_APP_SECRET=${FEISHU_APP_SECRET:-}
+      - FEISHU_ENABLED=${FEISHU_ENABLED:-false}
+      # 前端 SPA 与 API 同源托管（FRONTEND_DIST 指向构建产物）
+      - FRONTEND_DIST=/app/frontend/dist
+    depends_on:
+      - redis
+      - qdrant
+    volumes:
+      - ./app:/app/app
+      - ./skills:/app/skills
+      - ./frontend/dist:/app/frontend/dist
+      - ./data:/app/data
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    container_name: lifeos-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./redisdata:/data
+    restart: always
+
+  qdrant:
+    image: qdrant/qdrant:v1.6.1
+    container_name: lifeos-qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - ./qdrantdata:/qdrant/storage
+    restart: always
