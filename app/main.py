@@ -5,6 +5,7 @@
 - OTP（TOTP + 会话令牌）按《复刻指导 03》实现，纯标准库
 """
 import os
+import json
 import asyncio
 import time
 import hmac
@@ -13,12 +14,14 @@ from typing import Optional
 
 from fastapi import FastAPI, Request, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app import auth
-from app.config import settings, mask_secret
+from app.config import settings, mask_secret, AIProfile
 from app.ai import client as ai_client
+from app.ai.usage_store import usage_store
+from app.ai.ratelimit import ai_rate_limiter
 from app.feishu import (bot, start_bot, stop_bot, bot_status, get_news)
 from app.feishu_deviceflow import FeishuDeviceFlow
 from app.agent.router import agent_router, MessagePayload
@@ -317,11 +320,73 @@ class ChatReq(BaseModel):
 
 @app.post("/api/agent/chat")
 async def agent_chat(req: ChatReq):
+    # Phase 4：场景限速（进程内滑动窗口，按用户）
+    if not ai_rate_limiter.allow(DEFAULT_USER):
+        return JSONResponse(status_code=429,
+                            content={"error": "请求过于频繁，请稍后再试", "code": "RATE_LIMITED"},
+                            headers={"Retry-After": "30"})
     # P0-04：外部 REST 不再接受客户端自填 user_id，统一用单用户身份 "me"
     reply = await agent_router.process_message(
         MessagePayload(user_id="me", message=req.message, source="debug",
                        time=str(int(time.time()))))
     return {"reply": reply}
+
+
+# ===== AI Gateway：模型健康自检 + 用量统计 + 流式对话 =====
+@app.get("/api/ai/probe")
+async def ai_probe():
+    """逐模型连通性自检（真实打模型，返回每个模型的 ok/latency）。"""
+    profs = []
+    active = settings.active_ai_profile()
+    if active:
+        profs.append(active)
+    for m in settings.ai_models:
+        if m.get("api_key"):
+            profs.append(AIProfile.from_dict(m))
+    models = []
+    for p in profs:
+        res = await ai_client.probe(model_profile=p)
+        models.append({
+            "id": p.id, "model": p.model, "ok": res.get("ok"),
+            "latency_ms": res.get("latency_ms"), "reason": res.get("reason"),
+        })
+    return {"ai_enabled": settings.ai_enabled, "models": models}
+
+
+@app.get("/api/ai/usage")
+async def ai_usage():
+    """当前用户 AI 用量汇总（来自 ai_usage 表；未配置 DB 时返回空结构）。"""
+    summary = await usage_store.summary(DEFAULT_USER)
+    return summary
+
+
+@app.post("/api/agent/chat/stream")
+async def agent_chat_stream(req: ChatReq):
+    """SSE 流式对话：逐块返回文本（打字机效果）。skill/multi_step 走非流式整段返回。"""
+    if not ai_rate_limiter.allow(DEFAULT_USER):
+        return JSONResponse(status_code=429,
+                            content={"error": "请求过于频繁，请稍后再试", "code": "RATE_LIMITED"},
+                            headers={"Retry-After": "30"})
+    return StreamingResponse(
+        _sse_chat(req.message),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+async def _sse_chat(message: str):
+    """把 router.stream_message 的纯文本片段包成 SSE 事件。"""
+    payload = MessagePayload(user_id="me", message=message, source="debug",
+                             time=str(int(time.time())))
+    try:
+        async for piece in agent_router.stream_message(payload):
+            yield f"data: {json.dumps({'delta': piece}, ensure_ascii=False)}\n\n"
+    except Exception as e:
+        yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+# ===== 调试/本地入口：直接对话 Agent（受 Bearer 保护）=====
 
 
 # ===== 待办 / 收支 REST（前后端共用 PgStore，按单用户实例隔离）=====

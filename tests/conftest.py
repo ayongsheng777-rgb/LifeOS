@@ -9,6 +9,12 @@ import tempfile
 os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="lifeos_test_")
 os.environ.pop("OTP_SECRET", None)        # 确保未绑定态可测 setup
 os.environ.pop("LIFEOS_SETUP_TOKEN", None)
+# 测试进程禁止连外部 PG / Redis / Qdrant（保持纯本地、确定性、不污染真实数据）。
+# 注意：必须设为空字符串而非 pop——config 的 load_dotenv() 在 import 时会从 .env 重新注入，
+# 而 dotenv 默认不覆盖已存在的变量，故先用空串占位即可屏蔽 .env 里的值。
+os.environ["DB_URL"] = ""
+os.environ["REDIS_URL"] = ""
+os.environ["QDRANT_URL"] = ""
 
 import pytest
 from fastapi.testclient import TestClient

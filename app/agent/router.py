@@ -89,7 +89,7 @@ class AgentRouter:
                 response = f"技能[{decision['skill']}]执行出错：{e}"
             # 技能返回 None → 交给 AI 默认对话（不卡死）
             if response is None:
-                response = await self._default_chat(message, context)
+                response = await self._default_chat(message, context, user_id=user_id)
         elif decision["type"] == "multi_step":
             response = await self._execute_multi_step(message, context, user_id)
         else:
@@ -116,7 +116,7 @@ class AgentRouter:
             return {"type": "chat", "skill": None}
         user_text = f"用户消息：{message}\n\n可用技能：\n{_format_skills(skills)}"
         try:
-            res = await client.chat_json(CLASSIFY_SYSTEM, user_text, cache_ttl=60)
+            res = await client.chat_json(CLASSIFY_SYSTEM, user_text, cache_ttl=60, scenario="classify")
         except Exception as e:
             log.warning("意图分类失败（降级 chat）: %s", e)
             return {"type": "chat", "skill": None}
@@ -153,7 +153,7 @@ class AgentRouter:
         skills = self.skill_registry.get_available_skills()
         user_text = f"用户请求：{message}\n\n可用技能：\n{_format_skills(skills)}"
         try:
-            plan = await client.chat_json(PLAN_SYSTEM, user_text, cache_ttl=60)
+            plan = await client.chat_json(PLAN_SYSTEM, user_text, cache_ttl=60, scenario="plan")
         except Exception as e:
             log.warning("多步规划失败（降级默认对话）: %s", e)
             return await self._default_chat(message, context)
@@ -181,7 +181,7 @@ class AgentRouter:
                 elif action == "ai":
                     arg = step.get("arg") or message
                     # 多步内的 AI 子步不单独沉淀长期记忆，最终汇总时统一沉淀一次
-                    reply = await self._default_chat(arg, context, save_exp=False)
+                    reply = await self._default_chat(arg, context, save_exp=False, user_id=user_id)
                     results.append(f"【步骤{i + 1}·AI】{reply}")
                 else:
                     results.append(f"【步骤{i + 1}】未识别动作：{action}")
@@ -197,7 +197,7 @@ class AgentRouter:
         return final
 
     # ===================== 默认对话（保留原逻辑）=====================
-    async def _default_chat(self, message: str, context: list, save_exp: bool = True) -> str:
+    async def _default_chat(self, message: str, context: list, save_exp: bool = True, user_id: str = "me") -> str:
         """未命中 Skill → AI 默认对话（AI 不可用时给友好兜底）。"""
         if not client.available():
             return (f"已收到您的消息：{message}\n"
@@ -221,11 +221,94 @@ class AgentRouter:
             except Exception as e:
                 log.warning("长期记忆检索失败（忽略）: %s", e)
         user_msg = f"{ctx_text}\n用户：{message}" if ctx_text else message
-        reply = await client.chat(CHAT_SYSTEM, user_msg, temperature=0.7, max_tokens=1024, cache_ttl=300)
+        reply = await client.chat(CHAT_SYSTEM, user_msg, temperature=0.7, max_tokens=1024,
+                                  cache_ttl=300, user_id=user_id, scenario="chat")
         # 沉淀长期记忆（可选；需 embedding 可用）
         if reply and save_exp:
             await self._save_experience(message, reply)
         return reply or "AI 暂时无回复，请稍后再试。"
+
+    # ===================== 流式默认对话（Phase 4）=====================
+    async def _default_chat_stream(self, message: str, context: list, user_id: str):
+        """流式版本：逐块 yield 文本；结束沉淀短期/长期记忆。AI 不可用 → 整段回声兜底。"""
+        if not client.available():
+            yield (f"已收到您的消息：{message}\n"
+                   f"（当前未配置 AI 模型或模型不可用，仅作回声；"
+                   f"请在设置中配置 AI_API_KEY 后获得智能回复。）")
+            return
+        ctx_text = ""
+        if context:
+            ctx_text = "\n".join(
+                [f"{'用户' if c['role'] == 'user' else '助手'}: {c['content']}" for c in context[-6:]]
+            )
+        lm = self.memory._ensure_long()
+        if lm is not None:
+            try:
+                vec = await client.embed(message)
+                if vec:
+                    hits = lm.search_similar(vec, limit=3, user_id=None)
+                    if hits:
+                        refs = "\n".join(f"- {h['payload'].get('text', '')}" for h in hits)
+                        ctx_text = (ctx_text + "\n[长期经验参考]\n" + refs) if ctx_text else ("[长期经验参考]\n" + refs)
+            except Exception as e:
+                log.warning("长期记忆检索失败（忽略）: %s", e)
+        user_msg = f"{ctx_text}\n用户：{message}" if ctx_text else message
+        full: list = []
+        async for piece in client.chat_stream(CHAT_SYSTEM, user_msg, temperature=0.7,
+                                              max_tokens=1024, user_id=user_id, scenario="chat"):
+            full.append(piece)
+            yield piece
+        reply = "".join(full)
+        if reply:
+            await self._save_experience(message, reply)
+            self.memory.add_short(user_id, message, reply)
+
+    async def stream_message(self, payload: MessagePayload):
+        """流式入口：意图判定后分流。
+
+        - skill / multi_step → 非流式整段返回（yield 一段）；
+        - chat → 走 _default_chat_stream 逐块流式。
+        任何分支结束都确保短期记忆落盘。
+        """
+        user_id = payload.user_id
+        message = payload.message
+
+        # 1. Clean-Slate
+        if message.strip() in ["/reset", "清空上下文", "新对话"]:
+            self.memory.clear_short(user_id)
+            self.memory.clear_working(user_id)
+            yield "上下文已彻底清空，已为您准备好全新的干净运行环境。"
+            return
+
+        # 2. 短期记忆 + 意图判定
+        context = self.memory.get_short(user_id)
+        available_skills = self.skill_registry.get_available_skills()
+        decision = await self._classify_intent_v2(message, available_skills)
+        try:
+            self.memory.set_working(user_id, "last_intent", decision["type"])
+            if decision.get("skill"):
+                self.memory.set_working(user_id, "last_skill", decision["skill"])
+        except Exception:
+            pass
+
+        # 3. 分发
+        if decision["type"] == "skill" and self.skill_registry.has_skill(decision["skill"]):
+            skill = self.skill_registry.get_skill(decision["skill"])
+            try:
+                response = await skill.execute(message, context, user_id=user_id)
+            except Exception as e:
+                response = f"技能[{decision['skill']}]执行出错：{e}"
+            if response is None:
+                response = await self._default_chat(message, context, user_id=user_id)
+            yield response
+            self.memory.add_short(user_id, message, response)
+        elif decision["type"] == "multi_step":
+            response = await self._execute_multi_step(message, context, user_id)
+            yield response
+            self.memory.add_short(user_id, message, response)
+        else:
+            async for piece in self._default_chat_stream(message, context, user_id):
+                yield piece
 
     def _ensure_long_memory(self):
         """懒加载长期记忆（委托 MemoryManager，失败置哨兵）。"""
