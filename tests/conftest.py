@@ -15,6 +15,7 @@ os.environ.pop("LIFEOS_SETUP_TOKEN", None)
 os.environ["DB_URL"] = ""
 os.environ["REDIS_URL"] = ""
 os.environ["QDRANT_URL"] = ""
+os.environ["CONNECTOR_WEBHOOK_TOKEN"] = ""
 
 import pytest
 from fastapi.testclient import TestClient

@@ -17,16 +17,16 @@ class FeishuDeviceFlow:
     async def start(self) -> dict:
         """发起授权，返回 {scan_url, poll_token, expires_in}。"""
         async with httpx.AsyncClient(timeout=20) as c:
-            # 1. init：确认支持 client_secret
-            r = await c.post(self.endpoint, json={"action": "init"})
+            # 1. init：确认支持 client_secret（飞书要求 form-urlencoded，字段在顶层）
+            r = await c.post(self.endpoint, data={"action": "init"})
             if r.status_code != 200:
                 return {"status": "error", "reason": f"init HTTP {r.status_code}"}
-            methods = (r.json().get("data", {}).get("supported_auth_methods") or [])
+            methods = (r.json().get("supported_auth_methods") or [])
             if "client_secret" not in methods:
                 return {"status": "error", "reason": "不支持 client_secret 授权"}
 
-            # 2. begin：拿到 device_code + verification_uri_complete
-            r2 = await c.post(self.endpoint, json={
+            # 2. begin：拿到 device_code + verification_uri_complete（form-urlencoded）
+            r2 = await c.post(self.endpoint, data={
                 "action": "begin",
                 "archetype": "PersonalAgent",
                 "auth_method": "client_secret",
@@ -34,7 +34,7 @@ class FeishuDeviceFlow:
             })
             if r2.status_code != 200:
                 return {"status": "error", "reason": f"begin HTTP {r2.status_code}"}
-            d = r2.json().get("data", {})
+            d = r2.json()
             device_code = d.get("device_code")
             uri = d.get("verification_uri_complete", "")
             if not device_code or not uri:
@@ -44,12 +44,13 @@ class FeishuDeviceFlow:
                     "expires_in": d.get("expires_in", 300)}
 
     async def poll(self, device_code: str) -> dict:
-        """轮询授权结果。"""
+        """轮询授权结果。飞书在 pending/denied/expired 时返回 4xx，真实状态在 body.error。"""
         async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.post(self.endpoint, json={"action": "poll", "device_code": device_code})
-            if r.status_code != 200:
+            r = await c.post(self.endpoint, data={"action": "poll", "device_code": device_code})
+            try:
+                d = r.json()
+            except Exception:
                 return {"status": "error", "reason": f"poll HTTP {r.status_code}"}
-            d = r.json().get("data", {})
             err = d.get("error")
             if err in ("authorization_pending", "slow_down"):
                 return {"status": "pending"}
@@ -61,4 +62,6 @@ class FeishuDeviceFlow:
             app_secret = d.get("client_secret")
             if app_id and app_secret:
                 return {"status": "success", "app_id": app_id, "app_secret": app_secret}
+            if err:
+                return {"status": "error", "reason": f"飞书返回: {err}"}
             return {"status": "pending"}
