@@ -99,6 +99,9 @@ class Settings:
     session_secret: str = ""
     session_ttl: int = 43200
 
+    # ---- Phase 6 Connector ----
+    connector_webhook_token: str = ""   # 入站 Webhook 共享密钥（留空则 /api/connector/webhook 不启用）
+
     def load_env(self) -> None:
         self.redis_url = os.environ.get("REDIS_URL", self.redis_url)
         self.qdrant_url = os.environ.get("QDRANT_URL", self.qdrant_url)
@@ -138,6 +141,7 @@ class Settings:
         self.otp_account = os.environ.get("OTP_ACCOUNT", self.otp_account)
         self.otp_secret = os.environ.get("OTP_SECRET", self.otp_secret)
         self.session_secret = os.environ.get("SESSION_SECRET", self.session_secret)
+        self.connector_webhook_token = os.environ.get("CONNECTOR_WEBHOOK_TOKEN", self.connector_webhook_token)
         try:
             self.session_ttl = int(os.environ.get("SESSION_TTL", str(self.session_ttl)))
         except ValueError:

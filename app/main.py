@@ -26,9 +26,10 @@ from app.feishu import (bot, start_bot, stop_bot, bot_status, get_news)
 from app.feishu_deviceflow import FeishuDeviceFlow
 from app.agent.router import agent_router, MessagePayload
 from app.skills.db_store import PgStore, init_db
+from app.connector import connector
 
 # ===== 鉴权白名单（03-OTP：勿扩大）=====
-PUBLIC_EXACT = {"/api/health"}
+PUBLIC_EXACT = {"/api/health", "/api/connector/webhook"}
 PUBLIC_PREFIXES = ("/api/auth/",)
 
 
@@ -149,6 +150,10 @@ async def health():
             "redis": "configured" if settings.redis_url else "not_configured",
             "qdrant": "configured" if settings.qdrant_url else "not_configured",
             "embedding": "configured" if settings.embedding_model else "not_configured",
+        },
+        "connector": {
+            "webhook": "configured" if settings.connector_webhook_token else "not_configured",
+            "feishu_push": bool(settings.feishu_enabled and settings.feishu_app_id),
         },
     }
 
@@ -318,6 +323,12 @@ class ChatReq(BaseModel):
     message: str
 
 
+class ConnectorPushReq(BaseModel):
+    channel: str            # "feishu" | "http"
+    target: str = ""        # feishu: "admin" 或 open_id；http: 完整 URL
+    message: str
+
+
 @app.post("/api/agent/chat")
 async def agent_chat(req: ChatReq):
     # Phase 4：场景限速（进程内滑动窗口，按用户）
@@ -380,6 +391,44 @@ async def skills_stats():
         "last_intent": working.get("last_intent"),
         "last_skill": working.get("last_skill"),
     }
+
+
+@app.get("/api/connector/status")
+async def connector_status():
+    """连接器状态（前端 Dashboard 展示）：webhook 是否启用、入站计数、飞书推送可用性。"""
+    return connector.status()
+
+
+@app.post("/api/connector/push")
+async def connector_push(req: ConnectorPushReq):
+    """出站推送：把一条消息推到飞书（管理员）或通用 HTTP 端点。需 Bearer 鉴权。"""
+    return await connector.push(req.channel, req.target, req.message)
+
+
+@app.post("/api/connector/webhook")
+async def connector_webhook(request: Request):
+    """通用入站 Webhook（机器调用）：共享令牌验签（header X-LifeOS-Webhook-Token 或 ?token=）。
+    未配置 CONNECTOR_WEBHOOK_TOKEN 时端点不启用（503）。按 body.type 路由 todo/memory/chat/raw。
+    """
+    expected = settings.connector_webhook_token
+    if not expected:
+        return JSONResponse(status_code=503,
+                            content={"error": "连接器 Webhook 未启用（请在服务端配置 CONNECTOR_WEBHOOK_TOKEN）",
+                                      "code": "WEBHOOK_DISABLED"})
+    provided = request.headers.get("X-LifeOS-Webhook-Token", "")
+    if not provided:
+        provided = request.query_params.get("token", "")
+    if not hmac.compare_digest(provided, expected):
+        return JSONResponse(status_code=401,
+                            content={"error": "Webhook 令牌无效", "code": "WEBHOOK_TOKEN_INVALID"})
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "body 需为 JSON"})
+    if not isinstance(payload, dict):
+        return JSONResponse(status_code=400, content={"error": "body 需为 JSON 对象"})
+    result = await connector.handle_inbound(payload)
+    return {"ok": True, "result": result}
 
 
 @app.post("/api/agent/chat/stream")

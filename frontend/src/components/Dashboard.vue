@@ -99,6 +99,26 @@
           </span>
         </div>
       </div>
+
+      <!-- 连接器 / Connector -->
+      <div class="card">
+        <div class="card-title">连接器（入站 Webhook / 出站推送）</div>
+        <div class="kv"><span class="muted">Webhook 入站</span>
+          <span class="tag" :class="conn.webhook_enabled ? 'ok' : 'warn'">
+            {{ conn.webhook_enabled ? '已启用' : '未配置令牌' }}
+          </span>
+        </div>
+        <div class="kv"><span class="muted">入站累计</span><span>{{ conn.inbound_count }} 次</span></div>
+        <div class="kv"><span class="muted">最近入站</span>
+          <span>{{ conn.last_inbound ? (conn.last_inbound.type + ' @' + new Date(conn.last_inbound.at * 1000).toLocaleTimeString('zh-CN')) : '—' }}</span>
+        </div>
+        <div class="kv"><span class="muted">飞书推送</span>
+          <span class="tag" :class="conn.feishu_push ? 'ok' : 'gray'">{{ conn.feishu_push ? '可用' : '未配置' }}</span>
+        </div>
+        <p class="muted conn-hint">外部系统向 <code>POST /api/connector/webhook</code> 推送 JSON（带 <code>X-LifeOS-Webhook-Token</code> 头），按 <code>type</code> 路由 todo / memory / chat / raw。</p>
+        <button class="ghost" :disabled="pushing || !conn.feishu_push" @click="testPush">📤 发送测试推送（飞书）</button>
+        <p v-if="pushMsg" class="muted">{{ pushMsg }}</p>
+      </div>
     </div>
 
     <!-- 最近记忆 -->
@@ -135,6 +155,9 @@ const shortList = ref([])
 const longConfigured = ref(false)
 const longList = ref([])
 const health = ref({ status: '—', ai_available: false, deps: {}, feishu: {} })
+const conn = ref({ webhook_enabled: false, inbound_count: 0, last_inbound: null, feishu_push: false })
+const pushing = ref(false)
+const pushMsg = ref('')
 
 const successRate = computed(() => {
   const c = usage.value.calls || 0
@@ -159,13 +182,14 @@ async function loadAll() {
   loading.value = true
   error.value = ''
   try {
-    const [u, d, sk, ms, ml, h] = await Promise.all([
+    const [u, d, sk, ms, ml, h, c] = await Promise.all([
       api.aiUsage().catch(() => null),
       api.aiUsageDaily(14).catch(() => null),
       api.skillsStats().catch(() => null),
       api.memoryShort().catch(() => null),
       api.memoryLong(50).catch(() => null),
       api.health().catch(() => null),
+      api.connectorStatus().catch(() => null),
     ])
     if (u) usage.value = { ...usage.value, ...(u || {}) }
     if (d?.daily) daily.value = d.daily
@@ -182,11 +206,30 @@ async function loadAll() {
       longList.value = ml.items || []
     }
     if (h) health.value = { status: h.status, ai_available: h.ai_available, deps: h.dependencies || {}, feishu: h.feishu || {} }
+    if (c) conn.value = { webhook_enabled: !!c.webhook_enabled, inbound_count: c.inbound_count || 0, last_inbound: c.last_inbound || null, feishu_push: !!c.feishu_push }
     lastUpdated.value = '更新于 ' + new Date().toLocaleTimeString('zh-CN')
   } catch (e) {
     error.value = e.message || '加载失败'
   } finally {
     loading.value = false
+  }
+}
+
+async function testPush() {
+  if (!conn.value.feishu_push) return
+  pushing.value = true
+  pushMsg.value = ''
+  try {
+    const r = await api.connectorPush('feishu', 'admin', 'LifeOS 连接器测试推送 ✅')
+    pushMsg.value = r.ok
+      ? ('已推送，成功 ' + (r.sent || 0) + ' 条')
+      : ('推送失败：' + (r.error || '未知原因'))
+  } catch (e) {
+    pushMsg.value = '推送异常：' + (e.message || e)
+  } finally {
+    pushing.value = false
+    const c = await api.connectorStatus().catch(() => null)
+    if (c) conn.value = { webhook_enabled: !!c.webhook_enabled, inbound_count: c.inbound_count || 0, last_inbound: c.last_inbound || null, feishu_push: !!c.feishu_push }
   }
 }
 

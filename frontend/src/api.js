@@ -98,6 +98,11 @@ export const api = {
   feishuDisconnect: () => request('POST', '/api/feishu/disconnect'),
   feishuBotStart: () => request('POST', '/api/feishu/bot-start'),
 
+  // 连接器 / Connector
+  connectorStatus: () => request('GET', '/api/connector/status'),
+  connectorPush: (channel, target, message) =>
+    request('POST', '/api/connector/push', { channel, target, message }),
+
   // 概览 / Dashboard
   aiUsage: () => request('GET', '/api/ai/usage'),
   aiUsageDaily: (days = 14) =>

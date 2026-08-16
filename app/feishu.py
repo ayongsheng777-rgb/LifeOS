@@ -382,6 +382,25 @@ class FeishuBotService:
         }
         return await self._do_send(chat_id, card["card"], "interactive", id_type)
 
+    # ===== 出站推送（供 Connector 调用）=====
+    async def push_to_users(self, users: list, text: str) -> int:
+        """向一组飞书 open_id 推送文本；返回成功发送数。未配置/未上线安全降级返回 0。"""
+        if not text:
+            return 0
+        users = [u for u in (users or []) if u]
+        if not users:
+            return 0
+        if not settings.feishu_enabled or not settings.feishu_app_id:
+            return 0
+        ok = 0
+        for uid in users:
+            try:
+                if await self._send_text(uid, text, id_type="user_id"):
+                    ok += 1
+            except Exception as e:
+                log.warning("飞书推送失败 %s: %s", uid, e)
+        return ok
+
 
 # ===== 模块级单例与启停（供 main.py lifespan 调用）=====
 bot = FeishuBotService()
