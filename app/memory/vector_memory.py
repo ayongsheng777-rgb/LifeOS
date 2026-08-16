@@ -67,3 +67,21 @@ class VectorMemory:
             limit=limit, query_filter=scroll_filter,
         )
         return [{"id": h.id, "score": h.score, "payload": h.payload} for h in hits]
+
+    def list_experiences(self, user_id: str = None, limit: int = 50) -> list:
+        """按 user_id（可选）滚动列出长期经验；用于记忆管理端点查看。"""
+        scroll_filter = None
+        if user_id:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            scroll_filter = Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))])
+        points, _ = self.client.scroll(
+            collection_name=self.collection_name,
+            scroll_filter=scroll_filter, limit=limit,
+            with_payload=True, with_vectors=False,
+        )
+        return [{"id": p.id, "payload": p.payload} for p in points]
+
+    def delete_experience(self, point_id) -> bool:
+        """按点 ID 删除一条长期经验；用于记忆管理端点。"""
+        self.client.delete(collection_name=self.collection_name, points_selector=point_id)
+        return True

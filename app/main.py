@@ -11,7 +11,7 @@ import hmac
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, Request, Header
+from fastapi import FastAPI, Request, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
@@ -270,6 +270,44 @@ async def feishu_disconnect():
 @app.get("/api/feishu/news")
 async def feishu_news():
     return {"count": len(get_news()), "items": get_news()[-20:]}
+
+
+# ===== 记忆管理端点（受 Bearer 保护）=====
+# 三层记忆：工作(进程内) / 短期(Redis) / 长期(Qdrant)。
+# 长期记忆若未配置/不可用，优雅返回 configured:false，不报错。
+@app.get("/api/memory/short")
+async def memory_short():
+    uid = DEFAULT_USER
+    return {
+        "working": agent_router.memory.get_working(uid),
+        "short": agent_router.memory.get_short(uid),
+    }
+
+
+@app.delete("/api/memory/short")
+async def memory_short_clear():
+    uid = DEFAULT_USER
+    agent_router.memory.clear_short(uid)
+    agent_router.memory.clear_working(uid)
+    return {"ok": True}
+
+
+@app.get("/api/memory/long")
+async def memory_long(limit: int = 50):
+    items = agent_router.memory.list_long(DEFAULT_USER, limit=limit)
+    if items is None:
+        return {"configured": False, "items": []}
+    return {"configured": True, "items": items}
+
+
+@app.delete("/api/memory/long")
+async def memory_long_delete(id: str = Query("", description="要删除的长期经验点 ID")):
+    if not id:
+        return JSONResponse(status_code=400, content={"error": "需提供 id 参数（要删除的长期经验点 ID）"})
+    ok = agent_router.memory.delete_long(id)
+    if not ok:
+        return JSONResponse(status_code=503, content={"error": "长期记忆未配置/不可用"})
+    return {"ok": True}
 
 
 # ===== 调试/本地入口：直接对话 Agent（受 Bearer 保护）=====

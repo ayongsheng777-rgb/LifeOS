@@ -17,8 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from app.skills.loader import SkillRegistry
-from app.memory.short_memory import ShortMemory
-from app.memory.vector_memory import VectorMemory
+from app.memory import MemoryManager
 from app.ai import client
 from app.ai.prompt import CHAT_SYSTEM, CLASSIFY_SYSTEM, PLAN_SYSTEM
 from app.config import settings
@@ -54,26 +53,34 @@ class AgentRouter:
     def __init__(self):
         self.skill_registry = SkillRegistry(SKILLS_DIR)
         self.skill_registry.load_all_skills()
-        self.short_memory = ShortMemory()
-        self.long_memory = None  # 长期记忆懒加载；不可用时置 False（哨兵），不再重试
+        self.memory = MemoryManager()  # 统一编排 工作/短期/长期 三层记忆
 
     async def process_message(self, payload: MessagePayload) -> str:
         user_id = payload.user_id
         message = payload.message
 
-        # 1. Clean-Slate 隔离保护
+        # 1. Clean-Slate 隔离保护（同时清空 短期 + 工作 两层）
         if message.strip() in ["/reset", "清空上下文", "新对话"]:
-            self.short_memory.clear(user_id)
+            self.memory.clear_short(user_id)
+            self.memory.clear_working(user_id)
             return "上下文已彻底清空，已为您准备好全新的干净运行环境。"
 
-        # 2. 获取当前短期记忆
-        context = self.short_memory.get(user_id)
+        # 2. 获取当前短期记忆（Redis 多轮历史）
+        context = self.memory.get_short(user_id)
 
         # 3. 意图识别（关键词快路 + AI 兜底）
         available_skills = self.skill_registry.get_available_skills()
         decision = await self._classify_intent_v2(message, available_skills)
 
-        # 4. 分发执行
+        # 4. 工作记忆：记录本轮意图/命中技能，供后续与调试查看（不阻断主流程）
+        try:
+            self.memory.set_working(user_id, "last_intent", decision["type"])
+            if decision.get("skill"):
+                self.memory.set_working(user_id, "last_skill", decision["skill"])
+        except Exception:
+            pass
+
+        # 5. 分发执行
         if decision["type"] == "skill" and self.skill_registry.has_skill(decision["skill"]):
             skill = self.skill_registry.get_skill(decision["skill"])
             try:
@@ -88,8 +95,8 @@ class AgentRouter:
         else:
             response = await self._default_chat(message, context)
 
-        # 5. 更新短期记忆
-        self.short_memory.add(user_id, message, response)
+        # 6. 更新短期记忆
+        self.memory.add_short(user_id, message, response)
         return response
 
     # ===================== V2：意图分类 =====================
@@ -202,7 +209,7 @@ class AgentRouter:
                 [f"{'用户' if c['role'] == 'user' else '助手'}: {c['content']}" for c in context[-6:]]
             )
         # 长期记忆检索（可选：需 Qdrant 可用 + 已配置 EMBEDDING_MODEL；失败不影响主流程）
-        lm = self._ensure_long_memory()
+        lm = self.memory._ensure_long()
         if lm is not None:
             try:
                 vec = await client.embed(message)
@@ -221,29 +228,12 @@ class AgentRouter:
         return reply or "AI 暂时无回复，请稍后再试。"
 
     def _ensure_long_memory(self):
-        """懒加载长期记忆；失败置 False 哨兵，避免每次对话都重试连接。"""
-        if self.long_memory is False:
-            return None
-        if self.long_memory is None:
-            try:
-                self.long_memory = VectorMemory()
-            except Exception as e:
-                log.warning("长期记忆（Qdrant）不可用，已降级关闭: %s", e)
-                self.long_memory = False
-        return self.long_memory if self.long_memory else None
+        """懒加载长期记忆（委托 MemoryManager，失败置哨兵）。"""
+        return self.memory._ensure_long()
 
     async def _save_experience(self, user_msg: str, assistant_msg: str) -> None:
-        """把本轮对话（用户+助手）向量化后存入长期记忆；任一环节失败均忽略。"""
-        lm = self._ensure_long_memory()
-        if lm is None:
-            return
-        text = f"用户：{user_msg}\n助手：{assistant_msg}"
-        try:
-            vec = await client.embed(text)
-            if vec:
-                lm.save_experience("me", text, vec)
-        except Exception as e:
-            log.warning("长期经验保存失败（忽略）: %s", e)
+        """沉淀长期记忆（委托 MemoryManager，带重要性护栏，失败忽略）。"""
+        await self.memory.save_long_if_important("me", user_msg, assistant_msg)
 
 
 # 单例
