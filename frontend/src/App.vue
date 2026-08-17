@@ -10,6 +10,7 @@
         <button class="nav" :class="{ active: tab === 'expense' }" @click="tab = 'expense'">💰 记账</button>
         <button class="nav" :class="{ active: tab === 'news' }" @click="tab = 'news'">📰 资讯</button>
         <button class="nav" :class="{ active: tab === 'feishu' }" @click="tab = 'feishu'">🟢 飞书</button>
+        <button class="nav" :class="{ active: tab === 'models' }" @click="tab = 'models'">🧩 模型</button>
         <button class="nav" :class="{ active: tab === 'config' }" @click="tab = 'config'">⚙️ 设置</button>
       </nav>
       <div class="side-foot">
@@ -23,7 +24,8 @@
       <Expense v-else-if="tab === 'expense'" />
       <News v-else-if="tab === 'news'" />
       <Feishu v-else-if="tab === 'feishu'" />
-      <Config v-else-if="tab === 'config'" />
+      <ModelConfig v-else-if="tab === 'models'" />
+      <Config v-else-if="tab === 'config'" @goto="(t) => (tab = t)" />
     </main>
   </div>
 </template>
@@ -38,6 +40,7 @@ import Todo from './components/Todo.vue'
 import Expense from './components/Expense.vue'
 import News from './components/News.vue'
 import Feishu from './components/Feishu.vue'
+import ModelConfig from './components/ModelConfig.vue'
 import Config from './components/Config.vue'
 
 const token = ref(getToken())

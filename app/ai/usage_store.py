@@ -6,7 +6,8 @@
 设计：
 - 每次 AI 调用（无论成败）记录一条：模型、场景、输入/输出 token、估算费用、耗时、成败、错误。
 - DB 未配置（无 DB_URL）时优雅 no-op，不阻断主流程。
-- 费用按模型名查近似定价表估算（USD/1K tokens），仅作参考。
+- 费用按模型名查官方单价知识库估算（元/每百万 token，见 app.ai.model_presets），
+  仅作参考；未知模型记 0。
 """
 import time
 import uuid
@@ -20,32 +21,15 @@ from app.skills.db_store import Base, get_sessionmaker
 
 log = logging.getLogger("lifeos.ai.usage")
 
-# 近似定价（USD / 1K tokens）：输入价, 输出价。仅作参考，非实时。
-_PRICING = {
-    "deepseek-chat": (0.00027, 0.0011),
-    "deepseek-reasoner": (0.00055, 0.0022),
-    "deepseek-v3": (0.00027, 0.0011),
-    "deepseek-v4": (0.00027, 0.0011),
-    "gpt-4o": (0.0025, 0.01),
-    "gpt-4o-mini": (0.00015, 0.0006),
-    "gpt-3.5-turbo": (0.0005, 0.0015),
-    "claude-3-5-sonnet": (0.003, 0.015),
-    "claude-3-5-haiku": (0.0008, 0.004),
-    "glm-4": (0.00027, 0.0011),
-    "qwen-max": (0.0004, 0.0012),
-    "qwen-plus": (0.0002, 0.0006),
-    "moonshot": (0.0006, 0.0018),
-    "kimi-k3": (0.0006, 0.0018),
-}
+# 费用单位：元（CNY）。单价取自 model_presets.OFFICIAL_PRICING_CNY
+# （元/每百万 token，输入/输出分开），作为 Token 费用统计参考。
+# 未知模型返回 0（不估算），与指导文档「无 usage 记 0」原则一致。
+from app.ai.model_presets import estimate_cost_cny  # noqa: E402
 
 
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """按模型名估算费用（USD）。未知模型返回 0。"""
-    price = _PRICING.get((model or "").lower())
-    if not price:
-        return 0.0
-    in_price, out_price = price
-    return round(in_price * (input_tokens / 1000.0) + out_price * (output_tokens / 1000.0), 6)
+    """按模型名查官方单价知识库估算费用（元）。未知模型返回 0。"""
+    return estimate_cost_cny(model, input_tokens, output_tokens)
 
 
 class AIUsage(Base):

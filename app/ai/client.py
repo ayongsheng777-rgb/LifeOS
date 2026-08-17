@@ -394,3 +394,86 @@ def _human_error(code: int, body: str) -> str:
             return "频率/额度受限（429）：疑似欠费或额度不足"
         return "频率受限（429）：稍后重试"
     return f"HTTP {code}: {body[:160]}"
+
+
+async def speed_test(model_profile=None, rounds: int = 3, require_enabled: bool = False) -> dict:
+    """测速：对指定模型跑 N 轮流式请求，返回每轮 TTFT(首字延迟)/总延迟/输出 token/吞吐(tps) + 均值。
+
+    失败静默返回结构化结果（ok=False + reason），不抛异常。
+    """
+    mp = model_profile or settings.active_ai_profile()
+    if mp is None or not getattr(mp, "api_key", ""):
+        return {"ok": False, "reason": "未配置有效 api_key"}
+    base_url = mp.base_url.rstrip("/")
+    proxy = getattr(mp, "proxy", "") or settings.ai_proxy or None
+    model = mp.model
+    if not model:
+        return {"ok": False, "reason": "模型名为空"}
+    headers = {"Authorization": f"Bearer {mp.api_key}", "Content-Type": "application/json"}
+    if getattr(mp, "user_agent", ""):
+        headers["User-Agent"] = mp.user_agent
+    payload = {"model": model, "messages": [{"role": "user", "content": "请用一句话介绍你自己"}],
+               "max_tokens": 64, "temperature": 0.7, "stream": True}
+    rounds = max(1, min(int(rounds or 3), 10))
+    results = []
+    for _ in range(rounds):
+        t0 = time.time()
+        ttft = None
+        out_tok = 0
+        full: list = []
+        try:
+            async with _SEM:
+                async with httpx.AsyncClient(proxy=proxy, timeout=httpx.Timeout(60)) as hc:
+                    async with hc.stream("POST", f"{base_url}/chat/completions",
+                                         headers=headers, json=payload) as resp:
+                        if resp.status_code != 200:
+                            body = await resp.aread()
+                            results.append({"ok": False,
+                                            "reason": _human_error(resp.status_code,
+                                                                   body[:200].decode("utf-8", "ignore"))})
+                            continue
+                        async for line in resp.aiter_lines():
+                            line = line.strip()
+                            if not line or not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if data == "[DONE]":
+                                break
+                            try:
+                                obj = json.loads(data)
+                            except Exception:
+                                continue
+                            if obj.get("usage"):
+                                out_tok = obj["usage"].get("completion_tokens") or out_tok
+                            choices = obj.get("choices") or [{}]
+                            delta = choices[0].get("delta", {}) if choices else {}
+                            piece = delta.get("content") or delta.get("reasoning_content") or ""
+                            if piece and ttft is None:
+                                ttft = (time.time() - t0) * 1000
+                            if piece:
+                                full.append(piece)
+        except Exception as e:
+            results.append({"ok": False, "reason": f"{type(e).__name__}: {e}"})
+            continue
+        total_ms = (time.time() - t0) * 1000
+        text = "".join(full)
+        if not out_tok:
+            out_tok = max(0, len(text) // 4)
+        tps = (out_tok / (total_ms / 1000.0)) if total_ms > 0 else 0
+        results.append({
+            "ok": True,
+            "ttft_ms": round(ttft if ttft is not None else total_ms, 1),
+            "latency_ms": round(total_ms, 1),
+            "output_tokens": out_tok,
+            "tps": round(tps, 2),
+        })
+    ok_rounds = [r for r in results if r.get("ok")]
+    avg = None
+    if ok_rounds:
+        avg = {
+            "ttft_ms": round(sum(r["ttft_ms"] for r in ok_rounds) / len(ok_rounds), 1),
+            "latency_ms": round(sum(r["latency_ms"] for r in ok_rounds) / len(ok_rounds), 1),
+            "tps": round(sum(r["tps"] for r in ok_rounds) / len(ok_rounds), 2),
+        }
+    return {"ok": bool(ok_rounds), "model": model, "rounds": results, "avg": avg,
+            "success": len(ok_rounds), "total": rounds}

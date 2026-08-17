@@ -66,6 +66,7 @@ class AIProfile:
         return _is_valid_key(self.api_key)
 
 
+@dataclass
 class Settings:
     # ---- 基础设施 ----
     redis_url: str = "redis://redis:6379/0"
@@ -101,6 +102,10 @@ class Settings:
 
     # ---- Phase 6 Connector ----
     connector_webhook_token: str = ""   # 入站 Webhook 共享密钥（留空则 /api/connector/webhook 不启用）
+
+    # ---- 技能管理（设置页可配置）----
+    # API 技能：纯配置驱动的 HTTP 调用技能（如高德地图），无需写代码即可新增。
+    api_skills: list = field(default_factory=list)  # [dict] 字段约定见 upsert_api_skill
 
     def load_env(self) -> None:
         self.redis_url = os.environ.get("REDIS_URL", self.redis_url)
@@ -162,13 +167,15 @@ class Settings:
         except (FileNotFoundError, json.JSONDecodeError):
             return
         for k in ("feishu_app_id", "feishu_app_secret", "feishu_enabled",
-                  "feishu_trusted_bots", "feishu_admin_users", "ai_enabled"):
+                  "feishu_trusted_bots", "feishu_admin_users", "ai_enabled",
+                  "ai_models", "ai_active", "scenario_models", "api_skills"):
             if k in data:
                 setattr(self, k, data[k])
 
     def _save_runtime(self) -> None:
         keep = ("feishu_app_id", "feishu_app_secret", "feishu_enabled",
-                "feishu_trusted_bots", "feishu_admin_users", "ai_enabled")
+                "feishu_trusted_bots", "feishu_admin_users", "ai_enabled",
+                "ai_models", "ai_active", "scenario_models", "api_skills")
         snap = {k: getattr(self, k) for k in keep}
         try:
             with open(self._runtime_path(), "w", encoding="utf-8") as f:
@@ -191,6 +198,85 @@ class Settings:
             if isinstance(v, str) and v.startswith("****") and hasattr(self, k):
                 continue
             setattr(self, k, v)
+        self._save_runtime()
+
+    # ===== 模型配置持久化（完美模型配置模块）=====
+    def save_ai_profiles(self, models: list, active: str = None,
+                         scenario_models: dict = None) -> None:
+        """整批写回模型配置（重启保留）。"""
+        self.ai_models = models or []
+        if active is not None:
+            self.ai_active = active
+        if scenario_models is not None:
+            self.scenario_models = scenario_models or {}
+        self._save_runtime()
+
+    def upsert_ai_model(self, model: dict) -> list:
+        """新增或更新一条模型配置（按 id 去重），持久化并返回完整列表。"""
+        mid = model.get("id")
+        models = [m for m in self.ai_models if m.get("id") != mid]
+        models.append(model)
+        self.ai_models = models
+        self._save_runtime()
+        return self.ai_models
+
+    def remove_ai_model(self, mid: str) -> list:
+        """删除一条模型配置（按 id）；若删的是默认则退回第一条。持久化并返回列表。"""
+        self.ai_models = [m for m in self.ai_models if m.get("id") != mid]
+        if self.ai_active == mid:
+            self.ai_active = self.ai_models[0].get("id") if self.ai_models else "default"
+        self._save_runtime()
+        return self.ai_models
+
+    def set_active_ai_model(self, mid: str) -> None:
+        """设置当前默认生效模型并持久化。"""
+        self.ai_active = mid
+        self._save_runtime()
+
+    # ===== API 技能（设置页新增的可调用 HTTP 技能）=====
+    # 字段约定（dict）：
+    #   id: str（唯一，自动用 name 规范化）
+    #   name: str（技能名，用于路由与展示）
+    #   description: str
+    #   trigger_keywords: list[str]
+    #   api_url: str（支持 {query} 占位符）
+    #   api_key: str（可选，作为 Bearer 注入）
+    #   method: "GET" | "POST"（默认 GET）
+    #   enabled: bool（默认 True）
+    def upsert_api_skill(self, entry: dict) -> list:
+        """新增或更新一条 API 技能（按 id 去重），持久化并返回完整列表。"""
+        name = (entry.get("name") or "").strip()
+        if not name:
+            raise ValueError("name 不能为空")
+        sid = entry.get("id") or name
+        item = {
+            "id": sid,
+            "name": name,
+            "description": entry.get("description", ""),
+            "trigger_keywords": entry.get("trigger_keywords") or [],
+            "api_url": entry.get("api_url", ""),
+            "api_key": entry.get("api_key", ""),
+            "method": (entry.get("method") or "GET").upper(),
+            "enabled": bool(entry.get("enabled", True)),
+        }
+        skills = [s for s in self.api_skills if s.get("id") != sid]
+        skills.append(item)
+        self.api_skills = skills
+        self._save_runtime()
+        return self.api_skills
+
+    def remove_api_skill(self, sid: str) -> list:
+        """删除一条 API 技能（按 id），持久化并返回列表。"""
+        self.api_skills = [s for s in self.api_skills if s.get("id") != sid]
+        self._save_runtime()
+        return self.api_skills
+
+    def set_api_skill_enabled(self, sid: str, enabled: bool) -> None:
+        """启用/停用一条 API 技能并持久化。"""
+        for s in self.api_skills:
+            if s.get("id") == sid:
+                s["enabled"] = bool(enabled)
+                break
         self._save_runtime()
 
     # ===== AI 配置辅助（04-AI 指导）=====

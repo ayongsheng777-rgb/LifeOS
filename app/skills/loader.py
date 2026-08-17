@@ -6,6 +6,7 @@
 - handler.py: class SkillHandler: def __init__(self, metadata): ...; async def execute(self, message, context) -> str
 """
 import os
+import sys
 import yaml
 import importlib
 
@@ -39,12 +40,22 @@ class SkillRegistry:
         folder = os.path.basename(folder_path)
         module_name = f"{self.skills_dir}.{folder}.handler"
         try:
-            module = importlib.import_module(module_name)
+            if module_name in sys.modules:
+                # 热重载：文件已变更时重新编译，避免缓存旧代码
+                importlib.reload(sys.modules[module_name])
+                module = sys.modules[module_name]
+            else:
+                module = importlib.import_module(module_name)
             handler_instance = module.SkillHandler(metadata)
             self.skills[skill_name] = handler_instance
             print(f"[Skill] 已加载: {skill_name}")
         except Exception as e:
             print(f"[Skill Error] 加载 {skill_name} 失败: {e}")
+
+    def reload_all_skills(self):
+        """清空并重新扫描全部技能包（热插拔），随后由调用方注入 API 技能。"""
+        self.skills = {}
+        self.load_all_skills()
 
     def get_available_skills(self):
         out = []

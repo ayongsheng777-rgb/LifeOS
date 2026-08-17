@@ -9,6 +9,7 @@ import json
 import asyncio
 import time
 import hmac
+import httpx
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -18,13 +19,17 @@ from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app import auth
-from app.config import settings, mask_secret, AIProfile
+from app.config import settings, mask_secret, AIProfile, _is_valid_key
 from app.ai import client as ai_client
+from app.ai import model_presets
 from app.ai.usage_store import usage_store
 from app.ai.ratelimit import ai_rate_limiter
 from app.feishu import (bot, start_bot, stop_bot, bot_status, get_news)
 from app.feishu_deviceflow import FeishuDeviceFlow
 from app.agent.router import agent_router, MessagePayload
+from app.skills.api_skill import (build_api_skills_into, write_skill_package,
+                                  delete_skill_package, sanitize_skill_name,
+                                  ApiSkillHandler)
 from app.skills.db_store import PgStore, init_db
 from app.connector import connector
 
@@ -156,6 +161,12 @@ async def health():
             "feishu_push": bool(settings.feishu_enabled and settings.feishu_app_id),
         },
     }
+
+
+@app.get("/api/status")
+async def status_view():
+    """系统状态（设置页展示用）：依赖可用性 + AI/飞书/连接器状态。与 /api/health 同源。"""
+    return await health()
 
 
 # ===== OTP 端点（03-OTP）=====
@@ -377,6 +388,188 @@ async def ai_usage_daily(days: int = Query(14, ge=1, le=90)):
     return {"days": days, "daily": await usage_store.daily_summary(DEFAULT_USER, days=days)}
 
 
+# ===== 完美模型配置模块：预设库 / 获取模型列表 / 测速 / Token费用参考 / 模型增删改 =====
+class ModelFetchReq(BaseModel):
+    base_url: str
+    api_key: str = ""
+    proxy: Optional[str] = None
+
+
+class ModelSpeedReq(BaseModel):
+    id: Optional[str] = None          # 复用已配置模型（带有效 key）
+    base_url: Optional[str] = None   # 或内联传入
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    proxy: Optional[str] = None
+    rounds: int = 3
+
+
+class ModelUpsertReq(BaseModel):
+    id: str
+    name: Optional[str] = None
+    base_url: str
+    model: str
+    api_key: str = ""
+    proxy: Optional[str] = None
+    tags: list = []
+
+
+class ModelActiveReq(BaseModel):
+    id: str
+
+
+def _profile_from_req(req: ModelSpeedReq) -> Optional[AIProfile]:
+    """从请求构造模型档案：优先按 id 取已配置模型，否则用内联 base_url/model/api_key。"""
+    if req.id:
+        for m in settings.ai_models:
+            if m.get("id") == req.id and _is_valid_key(m.get("api_key", "")):
+                return AIProfile.from_dict(m)
+    if req.base_url and req.model and req.api_key:
+        return AIProfile(id=req.id or "adhoc", name=req.id or "adhoc",
+                         base_url=req.base_url, model=req.model,
+                         api_key=req.api_key, proxy=req.proxy or "")
+    return None
+
+
+@app.get("/api/models/presets")
+async def models_presets():
+    """预设厂商 + 模型目录（UI 一键添加用），含官方单价参考。"""
+    return model_presets.presets_for_ui()
+
+
+@app.get("/api/models")
+async def models_list():
+    """当前已配置模型清单（脱敏 key + 是否默认 + 是否可用）。"""
+    out = []
+    for m in settings.ai_models:
+        out.append({
+            "id": m.get("id"),
+            "name": m.get("name", m.get("id")),
+            "base_url": m.get("base_url", ""),
+            "model": m.get("model", ""),
+            "has_key": _is_valid_key(m.get("api_key", "")),
+            "api_key_masked": mask_secret(m.get("api_key", "")),
+            "proxy": m.get("proxy", ""),
+            "tags": m.get("tags", []) or [],
+            "is_active": m.get("id") == settings.ai_active,
+        })
+    return {"active": settings.ai_active, "models": out}
+
+
+@app.post("/api/models")
+async def models_upsert(req: ModelUpsertReq):
+    """新增或更新一条模型配置（按 id 去重），持久化到运行时配置。"""
+    mid = req.id.strip()
+    if not mid:
+        return JSONResponse(status_code=400, content={"error": "id 不能为空"})
+    # 自动从 base_url 推断 provider，并带出预设官方单价（供 UI 参考）
+    provider = model_presets.provider_of(req.base_url)
+    preset = model_presets.find_preset_model(provider, req.model)
+    entry = {
+        "id": mid,
+        "name": req.name or req.id,
+        "base_url": req.base_url.rstrip("/"),
+        "model": req.model,
+        "api_key": req.api_key,
+        "proxy": req.proxy or "",
+        "tags": req.tags or [],
+    }
+    models = settings.upsert_ai_model(entry)
+    # 若当前无默认，自动设为默认
+    if not _is_valid_key(settings.ai_active) or settings.ai_active not in {m.get("id") for m in models}:
+        if models:
+            settings.set_active_ai_model(models[0].get("id"))
+    return {"ok": True, "provider": provider,
+            "preset_pricing": preset, "models": len(models)}
+
+
+@app.delete("/api/models/{mid}")
+async def models_delete(mid: str):
+    """删除一条模型配置（按 id），持久化。"""
+    models = settings.remove_ai_model(mid)
+    return {"ok": True, "removed": mid, "active": settings.ai_active, "models": len(models)}
+
+
+@app.post("/api/models/active")
+async def models_set_active(req: ModelActiveReq):
+    """设置当前默认生效模型，持久化。"""
+    if not any(m.get("id") == req.id for m in settings.ai_models):
+        return JSONResponse(status_code=404, content={"error": "模型不存在"})
+    settings.set_active_ai_model(req.id)
+    return {"ok": True, "active": settings.ai_active}
+
+
+@app.post("/api/models/fetch")
+async def models_fetch(req: ModelFetchReq):
+    """获取模型列表：用 base_url + api_key 调 OpenAI 兼容的 /models 端点，返回真实可用模型。
+
+    便于用户「填好地址和 key → 一键拉取模型清单 → 选一个添加」。失败返回结构化 reason。
+    """
+    base_url = (req.base_url or "").rstrip("/")
+    if not base_url:
+        return JSONResponse(status_code=400, content={"error": "base_url 不能为空"})
+    proxy = req.proxy or settings.ai_proxy or None
+    headers = {}
+    if req.api_key:
+        headers["Authorization"] = f"Bearer {req.api_key}"
+    try:
+        async with httpx.AsyncClient(proxy=proxy, timeout=httpx.Timeout(20)) as hc:
+            resp = await hc.get(f"{base_url}/models", headers=headers)
+        if resp.status_code != 200:
+            return JSONResponse(status_code=502,
+                                content={"error": "获取失败",
+                                         "reason": _fetch_error(resp.status_code, resp.text[:200])})
+        data = resp.json()
+        items = data.get("data", []) if isinstance(data, dict) else []
+        models = []
+        for it in items:
+            if isinstance(it, dict):
+                models.append({"id": it.get("id"), "object": it.get("object", ""),
+                               "owned_by": it.get("owned_by", "")})
+        return {"ok": True, "count": len(models), "models": models,
+                "provider": model_presets.provider_of(base_url)}
+    except Exception as e:
+        return JSONResponse(status_code=502,
+                            content={"error": "网络异常", "reason": f"{type(e).__name__}: {e}"})
+
+
+@app.post("/api/models/speedtest")
+async def models_speedtest(req: ModelSpeedReq):
+    """测速：对指定模型跑 N 轮，返回 TTFT/延迟/吞吐(tps)。"""
+    mp = _profile_from_req(req)
+    if mp is None:
+        return JSONResponse(status_code=400,
+                            content={"error": "需提供有效 id 或 base_url+model+api_key"})
+    return await ai_client.speed_test(model_profile=mp, rounds=req.rounds)
+
+
+@app.get("/api/models/pricing")
+async def models_pricing():
+    """Token 费用参考：官方单价知识库（元/百万） + 当前用量折算费用。"""
+    pricing = []
+    for key, (inp, out) in model_presets.OFFICIAL_PRICING_CNY.items():
+        if not (isinstance(key, tuple) and len(key) == 2):
+            continue  # 跳过 (model,) 单独查价键，只取 (provider, model) 精确条目
+        prov, mdl = key
+        pricing.append({"provider": prov, "model": mdl,
+                        "in_per_million": inp, "out_per_million": out})
+    # 当前用量（来自 ai_usage 表；无 DB 时返回空结构）
+    usage = await usage_store.summary(DEFAULT_USER)
+    return {"unit": "元/每百万 token", "pricing": pricing, "usage": usage}
+
+
+def _fetch_error(code: int, body: str) -> str:
+    if code == 401:
+        return "Key 无效（401）：无法拉取模型列表"
+    if code == 403:
+        return "无权限（403）"
+    if code == 404:
+        return "该端点不支持 /models（404）：部分中转站未实现列表接口"
+    if code == 429:
+        return "频率受限（429）"
+    return f"HTTP {code}: {body[:160]}"
+
+
 @app.get("/api/skills/stats")
 async def skills_stats():
     """技能列表 + 命中计数 + 最近意图/技能（Dashboard 技能热度用）。"""
@@ -391,6 +584,179 @@ async def skills_stats():
         "last_intent": working.get("last_intent"),
         "last_skill": working.get("last_skill"),
     }
+
+
+# ===== 技能管理（设置页：API 技能 + 完整技能包）=====
+def _rebuild_skills() -> None:
+    """统一热重载：重新扫描技能包目录 + 注入配置驱动的 API 技能。"""
+    agent_router.skill_registry.reload_all_skills()
+    build_api_skills_into(agent_router.skill_registry)
+
+
+class ApiSkillReq(BaseModel):
+    id: Optional[str] = None
+    name: str
+    description: str = ""
+    trigger_keywords: list = []
+    api_url: str = ""
+    api_key: str = ""
+    method: str = "GET"
+    enabled: bool = True
+
+
+class SkillPackageReq(BaseModel):
+    name: str
+    description: str = ""
+    trigger_keywords: list = []
+    handler_code: str
+
+
+class SkillToggleReq(BaseModel):
+    enabled: bool = True
+
+
+@app.get("/api/skills")
+async def skills_mgmt_list():
+    """管理用技能清单：区分 API / 包 类型，含启用状态与脱敏 Key。
+
+    若某个 API 技能（api_skills 配置）的同名已由 skills/ 代码包接管
+    （如「高德地图」由 skills/amap 实现，仅借用其 api_key），则标记为
+    managed_by_package=True，前端据此提示「由完整技能包接管，此处仅管理 Key」。
+    """
+    registry = agent_router.skill_registry
+    api_ids = {s.get("id") for s in settings.api_skills}
+    items = []
+    for s in registry.get_available_skills():
+        name = s["name"]
+        handler = registry.skills.get(name)
+        is_pure_api = isinstance(handler, ApiSkillHandler)
+        entry = {
+            "name": name, "desc": s.get("desc"),
+            "trigger_keywords": s.get("trigger_keywords", []),
+            "type": "api" if is_pure_api else "package", "enabled": True,
+        }
+        if is_pure_api:
+            src = next((x for x in settings.api_skills if x.get("id") == name), {})
+            entry["api_url"] = src.get("api_url", "")
+            entry["api_key_masked"] = mask_secret(src.get("api_key", ""))
+            entry["method"] = src.get("method", "GET")
+        elif name in api_ids:
+            # 代码包接管，但 api_skills 中留有同名条目（用于存 Key）
+            entry["managed_by_package"] = True
+            src = next((x for x in settings.api_skills if x.get("id") == name), {})
+            entry["api_key_masked"] = mask_secret(src.get("api_key", ""))
+        items.append(entry)
+    # 补上已停用的纯 API 技能（未在路由表中）
+    live_names = {it["name"] for it in items}
+    for s in settings.api_skills:
+        if not s.get("enabled", True) and s.get("id") not in live_names:
+            items.append({
+                "name": s.get("name"), "desc": s.get("description", ""),
+                "trigger_keywords": s.get("trigger_keywords", []),
+                "type": "api", "enabled": False,
+                "api_url": s.get("api_url", ""),
+                "api_key_masked": mask_secret(s.get("api_key", "")),
+                "method": s.get("method", "GET"),
+            })
+    return {"skills": items, "skills_dir": os.path.abspath(os.environ.get("SKILLS_DIR", "skills"))}
+
+
+@app.get("/api/skills/api")
+async def api_skills_list():
+    """仅列出配置驱动的 API 技能（含脱敏 Key）。"""
+    out = []
+    for s in settings.api_skills:
+        out.append({
+            "id": s.get("id"), "name": s.get("name"),
+            "description": s.get("description", ""),
+            "trigger_keywords": s.get("trigger_keywords", []),
+            "api_url": s.get("api_url", ""),
+            "api_key_masked": mask_secret(s.get("api_key", "")),
+            "method": s.get("method", "GET"),
+            "enabled": s.get("enabled", True),
+        })
+    return {"api_skills": out}
+
+
+@app.post("/api/skills/api")
+async def api_skill_upsert(req: ApiSkillReq):
+    """新增/更新一条 API 技能，持久化并热重载路由。"""
+    name = (req.name or "").strip()
+    if not name:
+        return JSONResponse(status_code=400, content={"error": "name 不能为空"})
+    if req.method not in ("GET", "POST"):
+        return JSONResponse(status_code=400, content={"error": "method 仅支持 GET / POST"})
+    sid = req.id.strip() if req.id else name
+    try:
+        settings.upsert_api_skill({
+            "id": sid, "name": name, "description": req.description,
+            "trigger_keywords": req.trigger_keywords, "api_url": req.api_url,
+            "api_key": req.api_key, "method": req.method, "enabled": req.enabled,
+        })
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    _rebuild_skills()
+    return {"ok": True, "id": sid, "count": len(settings.api_skills)}
+
+
+@app.delete("/api/skills/api/{sid}")
+async def api_skill_delete(sid: str):
+    """删除一条 API 技能并热重载。"""
+    settings.remove_api_skill(sid)
+    _rebuild_skills()
+    return {"ok": True, "removed": sid, "count": len(settings.api_skills)}
+
+
+@app.post("/api/skills/api/{sid}/toggle")
+async def api_skill_toggle(sid: str, req: SkillToggleReq):
+    """启用/停用一条 API 技能并热重载。"""
+    settings.set_api_skill_enabled(sid, req.enabled)
+    _rebuild_skills()
+    return {"ok": True, "id": sid, "enabled": req.enabled}
+
+
+@app.post("/api/skills/package")
+async def skill_package_create(req: SkillPackageReq):
+    """写入一个完整技能包（skill.yaml + handler.py）并热加载。
+
+    安全：仅限本地单用户系统使用，handler_code 会被直接执行；
+    请仅添加自己信任的代码，避免任意外部来源粘贴。
+    """
+    name = (req.name or "").strip()
+    try:
+        sanitize_skill_name(name)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    code = (req.handler_code or "").strip()
+    if not code or "class SkillHandler" not in code:
+        return JSONResponse(status_code=400,
+                            content={"error": "handler_code 必须包含 class SkillHandler 定义"})
+    try:
+        folder = write_skill_package(name, req.description, req.trigger_keywords, code)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"写入失败：{e}"})
+    _rebuild_skills()
+    return {"ok": True, "name": name, "path": folder,
+            "warning": "handler.py 中的代码将在本进程直接执行，请仅添加可信代码"}
+
+
+@app.delete("/api/skills/package/{name}")
+async def skill_package_delete(name: str):
+    """删除一个完整技能包并热重载。"""
+    try:
+        sanitize_skill_name(name)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    delete_skill_package(name)
+    _rebuild_skills()
+    return {"ok": True, "removed": name}
+
+
+@app.post("/api/skills/reload")
+async def skills_reload():
+    """手动热重载全部技能（包 + API）。"""
+    _rebuild_skills()
+    return {"ok": True, "count": len(agent_router.skill_registry.skills)}
 
 
 @app.get("/api/connector/status")
@@ -554,21 +920,49 @@ async def delete_expense(eid: str):
     return {"ok": True}
 
 
-# ===== 配置查看（脱敏，供前端设置页）=====
+# ===== 配置查看 / 更新（供前端设置页）=====
 @app.get("/api/config")
 async def config_view():
+    # 当前生效模型名称（多模型库优先），消除旧单模型字段 ai_model 的冲突展示
+    active_name = settings.ai_active
+    for m in settings.ai_models:
+        if m.get("id") == settings.ai_active:
+            active_name = m.get("name", m.get("id"))
+            break
     return {
         "ai_enabled": settings.ai_enabled,
         "ai_active": settings.ai_active,
-        "ai_model": settings.ai_model,
-        "ai_base_url": settings.ai_base_url,
-        "ai_api_key_masked": mask_secret(settings.ai_api_key),
+        "ai_active_name": active_name,
         "ai_models_count": len(settings.ai_models),
+        "embedding_model": settings.embedding_model,
         "scenario_models": settings.scenario_models,
         "feishu_enabled": settings.feishu_enabled,
         "feishu_app_id_masked": mask_secret(settings.feishu_app_id),
         "otp_setup_open": auth.is_setup_open(),
     }
+
+
+class ConfigUpdateReq(BaseModel):
+    ai_enabled: Optional[bool] = None
+    embedding_model: Optional[str] = None
+    feishu_enabled: Optional[bool] = None
+
+
+@app.post("/api/config")
+async def config_update(req: ConfigUpdateReq):
+    """更新系统设置（AI 总开关 / 长期记忆模型 / 飞书启用）。受 Bearer 保护。"""
+    patch = {}
+    if req.ai_enabled is not None:
+        patch["ai_enabled"] = bool(req.ai_enabled)
+    if req.embedding_model is not None:
+        patch["embedding_model"] = req.embedding_model.strip()
+    if req.feishu_enabled is not None:
+        patch["feishu_enabled"] = bool(req.feishu_enabled)
+    if not patch:
+        return JSONResponse(status_code=400, content={"error": "无可更新字段"})
+    # upsert_setting 自带 **** 占位符保护，并落库 settings_runtime.json
+    settings.upsert_setting(patch)
+    return {"ok": True, **{k: getattr(settings, k) for k in patch}}
 
 
 # ===== 前端 SPA 托管（FRONTEND_DIST 指向构建产物 dist）=====

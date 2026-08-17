@@ -53,6 +53,9 @@ class AgentRouter:
     def __init__(self):
         self.skill_registry = SkillRegistry(SKILLS_DIR)
         self.skill_registry.load_all_skills()
+        # 配置驱动的 API 技能（设置页新增，无需写代码）注入路由表
+        from app.skills.api_skill import build_api_skills_into
+        build_api_skills_into(self.skill_registry)
         self.memory = MemoryManager()  # 统一编排 工作/短期/长期 三层记忆
 
     async def process_message(self, payload: MessagePayload) -> str:

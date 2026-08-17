@@ -69,6 +69,8 @@ export const api = {
   logout: () => request('POST', '/api/auth/logout'),
   health: () => request('GET', '/api/health'),
   config: () => request('GET', '/api/config'),
+  updateConfig: (payload) => request('POST', '/api/config', payload),
+  systemStatus: () => request('GET', '/api/status'),
 
   // 对话
   chat: (message, user_id = 'me') =>
@@ -111,4 +113,25 @@ export const api = {
   memoryShort: () => request('GET', '/api/memory/short'),
   memoryLong: (limit = 50) =>
     request('GET', '/api/memory/long' + (qs({ limit }) ? '?' + qs({ limit }) : '')),
+
+  // 完美模型配置模块
+  modelsPresets: () => request('GET', '/api/models/presets'),
+  listModels: () => request('GET', '/api/models'),
+  addModel: (payload) => request('POST', '/api/models', payload),
+  delModel: (id) => request('DELETE', `/api/models/${encodeURIComponent(id)}`),
+  setActiveModel: (id) => request('POST', '/api/models/active', { id }),
+  fetchModels: (base_url, api_key, proxy) =>
+    request('POST', '/api/models/fetch', { base_url, api_key: api_key || '', proxy: proxy || null }),
+  speedTest: (payload) => request('POST', '/api/models/speedtest', payload),
+  modelsPricing: () => request('GET', '/api/models/pricing'),
+
+  // 技能管理（设置页）
+  listSkillsMgmt: () => request('GET', '/api/skills'),
+  listApiSkills: () => (request('GET', '/api/skills/api')),
+  upsertApiSkill: (payload) => request('POST', '/api/skills/api', payload),
+  delApiSkill: (id) => request('DELETE', `/api/skills/api/${encodeURIComponent(id)}`),
+  toggleApiSkill: (id, enabled) => request('POST', `/api/skills/api/${encodeURIComponent(id)}/toggle`, { enabled }),
+  createSkillPackage: (payload) => request('POST', '/api/skills/package', payload),
+  delSkillPackage: (name) => request('DELETE', `/api/skills/package/${encodeURIComponent(name)}`),
+  reloadSkills: () => request('POST', '/api/skills/reload'),
 }
