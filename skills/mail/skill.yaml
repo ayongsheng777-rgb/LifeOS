@@ -1,0 +1,18 @@
+name: 邮件助手
+description: 邮件助手（系统默认内置技能，基于本机已授权的 Agent Mail / agently-cli）：查收件箱 / 看未读 / 搜索邮件 / 读邮件正文 / 发邮件。用法：① 查收件箱 ② 看未读邮件 ③ 搜索 报告 ④ 读邮件 msg_xxx ⑤ 发邮件给 alice@x.com 主题 周报 内容 本周进展。
+trigger_keywords:
+  - 邮件
+  - 邮箱
+  - 收件箱
+  - 发邮件
+  - 写邮件
+  - 查邮件
+  - 看邮件
+  - 读邮件
+  - 搜邮件
+  - 未读邮件
+  - 回邮件
+  - 写信
+  - mail
+  - email
+  - inbox

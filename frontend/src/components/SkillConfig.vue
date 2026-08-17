@@ -27,6 +27,17 @@
         <div class="bi-usage xsmall mono">天气 北京 ｜ 上海今天天气 ｜ 广州明天会下雨吗</div>
         <div class="xsmall muted">基于 Open-Meteo 公开数据，免费无需 Key，开箱即用。</div>
       </div>
+      <div class="bi-item">
+        <div class="bi-name">📧 邮件助手 <span class="badge b-pkg">技能包</span></div>
+        <div class="bi-func">
+          <span class="tag">查收件箱</span>
+          <span class="tag">看未读</span>
+          <span class="tag">搜索/读邮件</span>
+          <span class="tag">发邮件</span>
+        </div>
+        <div class="bi-usage xsmall mono">查收件箱 ｜ 看未读邮件 ｜ 搜索 报告 ｜ 读邮件 msg_xxx ｜ 发邮件给 a@x.com 主题 周报 内容 进展</div>
+        <div class="xsmall muted">基于本机已授权的 Agent Mail（agently-cli），无需额外配置 Key，开箱即用。</div>
+      </div>
     </section>
 
     <!-- 已配置技能列表 -->
