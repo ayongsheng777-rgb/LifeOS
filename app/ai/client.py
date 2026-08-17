@@ -13,6 +13,8 @@ import time
 import asyncio
 import logging
 import httpx
+import ipaddress
+from urllib.parse import urlparse
 
 from app.config import settings, AIProfile
 
@@ -347,12 +349,24 @@ async def embed(text: str, model: str = None, model_profile=None) -> list | None
         api_key = mp.api_key
         proxy = getattr(mp, "proxy", "") or settings.ai_proxy or None
         user_agent = getattr(mp, "user_agent", "")
+    # 内网/本机 embedding 端点：直连，不走任何代理（避免被系统 HTTP_PROXY 误转发到公网导致连不上）
+    _host = urlparse(base_url).hostname or ""
+    try:
+        _addr = ipaddress.ip_address(_host)
+        _is_private = _addr.is_private or _addr.is_loopback
+    except ValueError:
+        _is_private = _host in ("localhost",)
+    if _is_private:
+        proxy = None
+        trust_env = False
+    else:
+        trust_env = True  # 公网端点（如 OpenAI）沿用 ai_proxy / 系统代理
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     if user_agent:
         headers["User-Agent"] = user_agent
     try:
         async with _SEM:
-            async with httpx.AsyncClient(proxy=proxy, timeout=httpx.Timeout(30)) as hc:
+            async with httpx.AsyncClient(proxy=proxy, trust_env=trust_env, timeout=httpx.Timeout(30)) as hc:
                 resp = await hc.post(f"{base_url}/embeddings", headers=headers,
                                      json={"model": emb_model, "input": text})
         if resp.status_code != 200:

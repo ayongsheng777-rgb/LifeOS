@@ -7,7 +7,7 @@ import uuid
 
 try:
     from qdrant_client import QdrantClient
-    from qdrant_client.models import Distance, VectorParams, PointStruct
+    from qdrant_client.models import Distance, VectorParams, PointStruct, PointIdsList
     _QDRANT_AVAILABLE = True
 except ImportError:
     QdrantClient = Distance = VectorParams = PointStruct = None
@@ -83,5 +83,5 @@ class VectorMemory:
 
     def delete_experience(self, point_id) -> bool:
         """按点 ID 删除一条长期经验；用于记忆管理端点。"""
-        self.client.delete(collection_name=self.collection_name, points_selector=point_id)
+        self.client.delete(collection_name=self.collection_name, points_selector=PointIdsList(points=[point_id]))
         return True

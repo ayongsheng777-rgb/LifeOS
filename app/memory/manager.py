@@ -75,7 +75,7 @@ class MemoryManager:
             return None
         if self.long is None:
             try:
-                self.long = VectorMemory()
+                self.long = VectorMemory(vector_size=1024)  # bge-m3 = 1024 维；若改回 OpenAI 类 1536 模型需同步改此值
             except Exception as e:
                 log.warning("长期记忆（Qdrant）不可用，已降级关闭: %s", e)
                 self.long = False
