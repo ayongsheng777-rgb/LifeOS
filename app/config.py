@@ -115,6 +115,12 @@ class Settings:
     # API 技能：纯配置驱动的 HTTP 调用技能（如高德地图），无需写代码即可新增。
     api_skills: list = field(default_factory=list)  # [dict] 字段约定见 upsert_api_skill
 
+    # ---- 数据突变备份（本地磁盘 + NAS）----
+    local_backup_root: str = "F:\\LifeOS_BAK"   # 本地备份根目录
+    nas_backup_root: str = ""                    # NAS 挂载目录（已挂载可写路径）；留空则不备份 NAS
+    backup_retention_days: int = 7               # 每个目标保留最近 N 天
+    backup_schedule_hour: int = 3                # 每日定时备份时刻（0-23，默认凌晨 3 点）
+
     def load_env(self) -> None:
         self.redis_url = os.environ.get("REDIS_URL", self.redis_url)
         self.qdrant_url = os.environ.get("QDRANT_URL", self.qdrant_url)
@@ -171,6 +177,18 @@ class Settings:
             self.short_memory_ttl_days = int(os.environ.get("SHORT_MEMORY_TTL_DAYS", str(self.short_memory_ttl_days)))
         except ValueError:
             self.short_memory_ttl_days = 30
+
+        # 数据突变备份（本地磁盘 + NAS）
+        self.local_backup_root = os.environ.get("LOCAL_BACKUP_ROOT", self.local_backup_root)
+        self.nas_backup_root = os.environ.get("NAS_BACKUP_ROOT", self.nas_backup_root)
+        try:
+            self.backup_retention_days = int(os.environ.get("BACKUP_RETENTION_DAYS", str(self.backup_retention_days)))
+        except ValueError:
+            self.backup_retention_days = 7
+        try:
+            self.backup_schedule_hour = int(os.environ.get("BACKUP_SCHEDULE_HOUR", str(self.backup_schedule_hour)))
+        except ValueError:
+            self.backup_schedule_hour = 3
 
         # 运行时落库配置（扫码授权流写入）覆盖环境变量
         self._load_runtime()

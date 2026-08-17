@@ -32,6 +32,7 @@ from app.skills.api_skill import (build_api_skills_into, write_skill_package,
                                   ApiSkillHandler)
 from app.skills.db_store import PgStore, init_db, remember_fact, list_facts, delete_fact
 from app.connector import connector
+from app.backup import run_backup_all, start_backup_scheduler, stop_backup_scheduler, is_scheduler_running
 
 # ===== 鉴权白名单（03-OTP：勿扩大）=====
 PUBLIC_EXACT = {"/api/health", "/api/connector/webhook"}
@@ -81,8 +82,14 @@ async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
     if settings.feishu_enabled and settings.feishu_app_id and settings.feishu_app_secret:
         start_bot(loop)
+    # 启动：数据突变备份定时调度（每日 backup_schedule_hour，本地+NAS）
+    if settings.local_backup_root:
+        start_backup_scheduler(settings.local_backup_root, settings.nas_backup_root,
+                               settings.backup_retention_days, settings.data_dir,
+                               settings.backup_schedule_hour)
     yield
     # 关停
+    stop_backup_scheduler()
     await stop_bot()
 
 
@@ -405,6 +412,46 @@ async def agent_history():
         if text:
             messages.append({"role": role, "text": text})
     return {"messages": messages}
+
+
+# ===== 数据突变备份（本地磁盘 + NAS）=====
+@app.post("/api/backup/run")
+async def backup_run():
+    """手动触发一次全目标备份（本地+NAS）。数据导出在后台线程执行，不阻塞请求。"""
+    if not settings.local_backup_root:
+        return JSONResponse(status_code=400,
+                            content={"error": "未配置备份根目录（LOCAL_BACKUP_ROOT）"})
+    summary = await asyncio.to_thread(
+        run_backup_all,
+        settings.local_backup_root, settings.nas_backup_root,
+        settings.backup_retention_days, settings.data_dir,
+    )
+    return summary
+
+
+@app.get("/api/backup/status")
+async def backup_status():
+    """返回上次备份状态（各目标 manifest 概要）、当前配置。"""
+    targets = [t for t in (settings.local_backup_root, settings.nas_backup_root) if t]
+    out = []
+    for t in targets:
+        st = os.path.join(t, ".lifeos_backup_status.json")
+        if os.path.exists(st):
+            try:
+                with open(st, "r", encoding="utf-8") as f:
+                    out.append(json.load(f))
+                continue
+            except Exception:
+                pass
+        out.append({"target": t, "last_backup": None})
+    return {
+        "targets": out,
+        "local_root": settings.local_backup_root,
+        "nas_root": settings.nas_backup_root,
+        "retention_days": settings.backup_retention_days,
+        "schedule_hour": settings.backup_schedule_hour,
+        "scheduler_running": is_scheduler_running(),
+    }
 
 
 # ===== AI Gateway：模型健康自检 + 用量统计 + 流式对话 =====
