@@ -99,7 +99,7 @@ def _fmt_messages(msgs: list, title: str) -> str:
     if not msgs:
         return f"📭 {title}：没有邮件。"
     lines = [f"📬 {title}（共 {len(msgs)} 封）："]
-    for m in msgs:
+    for i, m in enumerate(msgs, 1):
         frm = m.get("from", {}) or {}
         frm_name = frm.get("name") or frm.get("email") or "?"
         subject = m.get("subject") or "(无主题)"
@@ -108,17 +108,19 @@ def _fmt_messages(msgs: list, title: str) -> str:
             snippet = snippet[:60] + "…"
         flag = "🔴" if not m.get("is_read") else "  "
         mid = m.get("message_id", "")
-        lines.append(f"{flag}【{frm_name}】{subject}")
+        lines.append(f"{flag}第{i}封【{frm_name}】{subject}")
         if snippet:
             lines.append(f"    {snippet}")
         lines.append(f"    id: {mid}")
-    lines.append("\n提示：说「读邮件 <上面 id>」可看正文。")
+    lines.append("\n提示：说「读第3封」即可看正文（无需复制长 ID）。")
     return "\n".join(lines)
 
 
 class SkillHandler:
     def __init__(self, metadata: dict):
         self.metadata = metadata
+        # 按用户缓存「最近一次邮件列表」，支持「读第N封」自然语言（避免复制长 ID）
+        self._last_list = {}
 
     async def execute(self, message: str, context: list, user_id: str = None) -> str:
         msg = (message or "").strip()
@@ -142,10 +144,15 @@ class SkillHandler:
         if m and any(k in msg for k in ("读", "查看", "看这封", "打开", "read")):
             return await self._read(m.group(0))
 
-        # 5) 兜底：列出收件箱
-        return await self._list("inbox")
+        # 5) 读第 N 封（自然语言，无需长 ID）
+        idx_m = re.search(r"第\s*(\d+)\s*封", msg)
+        if idx_m and any(k in msg for k in ("读", "看", "打开", "查看", "第")):
+            return await self._read_index(int(idx_m.group(1)), user_id)
 
-    async def _list(self, dir_name: str = "inbox", unread: bool = False, limit: int = 8) -> str:
+        # 6) 兜底：列出收件箱
+        return await self._list("inbox", user_id=user_id)
+
+    async def _list(self, dir_name: str = "inbox", unread: bool = False, limit: int = 8, user_id: str = None) -> str:
         args = ["message", "+list", "--dir", dir_name, "--limit", str(limit)]
         if unread:
             args += ["--is-unread"]
@@ -154,10 +161,12 @@ class SkillHandler:
         if not resp or not resp.get("ok"):
             return f"读取邮件失败：{_err_text(resp, err)}"
         msgs = _extract_messages(resp)
+        if user_id is not None:
+            self._last_list[user_id] = msgs
         title = "未读邮件" if unread else f"{dir_name} 收件箱"
         return _fmt_messages(msgs, title)
 
-    async def _search(self, msg: str) -> str:
+    async def _search(self, msg: str, user_id: str = None) -> str:
         q = _extract_after(msg, ["搜索", "搜", "查找", "关键词", "关于", "search"])
         if not q:
             q = msg.replace("搜索", "").replace("搜", "").replace("邮件", "").strip()
@@ -169,6 +178,8 @@ class SkillHandler:
         if not resp or not resp.get("ok"):
             return f"搜索失败：{_err_text(resp, err)}"
         msgs = _extract_messages(resp)
+        if user_id is not None:
+            self._last_list[user_id] = msgs
         return _fmt_messages(msgs, f"搜索「{q}」结果")
 
     async def _read(self, msg_id: str) -> str:
@@ -201,6 +212,17 @@ class SkillHandler:
         if atts:
             lines.append(f"\n📎 附件 {len(atts)} 个（用 attachment +download 下载）")
         return "\n".join(lines)
+
+    async def _read_index(self, n: int, user_id: str = None) -> str:
+        msgs = self._last_list.get(user_id) if user_id else None
+        if not msgs:
+            return "📭 还没有可读取的邮件列表，请先说「查收件箱」或「看未读邮件」，再告诉我第几封。"
+        if n < 1 or n > len(msgs):
+            return f"⚠️ 没有第 {n} 封，当前列表共 {len(msgs)} 封。"
+        mid = msgs[n - 1].get("message_id")
+        if not mid:
+            return "⚠️ 该邮件缺少 ID，无法读取。"
+        return await self._read(mid)
 
     async def _send(self, msg: str) -> str:
         to = _extract_after(msg, ["发给", "给", "发送到", "收件人", "to"])

@@ -7,7 +7,12 @@ class SkillHandler:
         self.metadata = metadata
 
     async def execute(self, message: str, context: list, user_id: str = None) -> str:
-        result = await analyzer.analyze_health(message)
+        # 把上下文里的「个人长期记忆」并入分析文本，使已知用药/健康信息可被回忆引用
+        text = message
+        for c in (context or []):
+            if c.get("role") == "system" and "[个人长期记忆]" in (c.get("content") or ""):
+                text = f"{message}\n\n（用户长期记忆参考：{c['content']}）"
+        result = await analyzer.analyze_health(text)
         if not result:
             return ("收到您的健康描述。当前未配置 AI 模型，无法做进一步整理；"
                     "建议您记录症状与用药时间，必要时及时就医。")

@@ -222,7 +222,7 @@ class FeishuBotService:
         except Exception as e:
             reply = f"处理出错：{e}"
         if reply:
-            await self._send_text(chat_id, reply)
+            await self._send_rich(chat_id, reply)
 
     # ===== 新闻素材摄入 =====
     def _news_dedup_key(self, urls, text):
@@ -371,6 +371,67 @@ class FeishuBotService:
 
     async def _send_text(self, chat_id: str, text: str, id_type: str = "chat_id") -> bool:
         return await self._do_send(chat_id, {"text": text}, "text", id_type)
+
+    async def _upload_image(self, url: str) -> str | None:
+        """下载图片并上传到飞书，返回 image_key（失败返回 None）。"""
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True,
+                                         headers={"User-Agent": "Mozilla/5.0 (compatible; LifeOS/2.0)"}) as c:
+                r = await c.get(url)
+            if r.status_code != 200:
+                return None
+            ctype = r.headers.get("content-type", "image/png") or "image/png"
+            if not ctype.startswith("image/"):
+                return None
+            token = await self._get_token()
+            if not token:
+                return None
+            async with httpx.AsyncClient(timeout=20) as up:
+                resp = await up.post(
+                    f"{FEISHU_API}/im/v1/images?image_type=message",
+                    headers={"Authorization": f"Bearer {token}"},
+                    data={"image_type": "message"},
+                    files={"image": ("lifeos_img", r.content, ctype)},
+                )
+                d = resp.json()
+                if d.get("code") == 0:
+                    return d.get("data", {}).get("image_key")
+        except Exception as e:
+            log.warning("飞书图片上传失败 %s: %s", url, e)
+        return None
+
+    async def _send_rich(self, chat_id: str, markdown: str, id_type: str = "chat_id") -> bool:
+        """把 Markdown 回复以『富文本卡片 + 图片消息』发送到飞书。
+
+        - 文本部分：interactive 卡片（lark_md 正文，支持加粗/链接/行内代码/列表）；
+          超过约 3500 字降级为纯文本，避免卡片超限。
+        - 图片部分：从正文抽取 ![alt](url)，逐张上传后作为 image 消息补发（最多 5 张）。
+        """
+        if not markdown or not markdown.strip():
+            return False
+        # 抽取并剔除图片占位
+        img_urls = re.findall(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", markdown)
+        text_md = re.sub(r"!\[[^\]]*\]\(https?://[^)\s]+\)", "", markdown).strip()
+        ok = True
+        if text_md:
+            if len(text_md) > 3500:
+                ok &= await self._send_text(chat_id, text_md, id_type)
+            else:
+                card = {
+                    "msg_type": "interactive",
+                    "card": {
+                        "header": {"template": "blue",
+                                   "title": {"tag": "plain_text", "content": "LifeOS"}},
+                        "elements": [{"tag": "div",
+                                      "text": {"tag": "lark_md", "content": text_md}}],
+                    },
+                }
+                ok &= await self._do_send(chat_id, card["card"], "interactive", id_type)
+        for url in img_urls[:5]:
+            key = await self._upload_image(url)
+            if key:
+                await self._do_send(chat_id, {"image_key": key}, "image", id_type)
+        return ok
 
     async def _send_card(self, chat_id: str, title: str, lines: list, id_type: str = "chat_id") -> bool:
         card = {

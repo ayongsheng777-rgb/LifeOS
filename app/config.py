@@ -70,7 +70,7 @@ class AIProfile:
 class Settings:
     # ---- 基础设施 ----
     redis_url: str = "redis://redis:6379/0"
-    qdrant_url: str = "http://qdrant:6333"
+    qdrant_url: str = "http://127.0.0.1:6333"   # 后端为宿主进程，经 localhost 访问 Docker 内的 Qdrant
     data_dir: str = "./data"
     db_url: str = ""   # Phase 1：PostgreSQL 连接串（postgresql+asyncpg://user:pw@host:port/db）；留空则待办/收支不可用
 
@@ -85,6 +85,10 @@ class Settings:
     ai_active: str = "default"
     scenario_models: dict = field(default_factory=dict)  # {scenario: model_id}
     embedding_model: str = ""   # 长期记忆 embedding 模型（OpenAI 兼容 /embeddings）；留空则不启用长期记忆
+    # 独立的 embedding 端点配置（可选）：当聊天模型供应商不支持 /embeddings 时，
+    # 用这里单独配置 embedding 服务（base_url + api_key），与聊天模型解耦。
+    embedding_base_url: str = ""
+    embedding_api_key: str = ""
 
     # ---- 飞书运行态（可运行时覆盖）----
     feishu_app_id: str = ""
@@ -99,6 +103,10 @@ class Settings:
     otp_secret: str = ""
     session_secret: str = ""
     session_ttl: int = 43200
+
+    # ---- 短期记忆（会话历史）保留策略 ----
+    short_memory_max_rounds: int = 50      # 最多保留多少轮对话（每轮=用户+AI 各1条）
+    short_memory_ttl_days: int = 30       # Redis 中会话历史保留天数（默认30天，原7天）
 
     # ---- Phase 6 Connector ----
     connector_webhook_token: str = ""   # 入站 Webhook 共享密钥（留空则 /api/connector/webhook 不启用）
@@ -129,6 +137,8 @@ class Settings:
         except json.JSONDecodeError:
             self.scenario_models = {}
         self.embedding_model = os.environ.get("EMBEDDING_MODEL", self.embedding_model)
+        self.embedding_base_url = os.environ.get("EMBEDDING_BASE_URL", self.embedding_base_url)
+        self.embedding_api_key = os.environ.get("EMBEDDING_API_KEY", self.embedding_api_key)
 
         self.feishu_app_id = os.environ.get("FEISHU_APP_ID", self.feishu_app_id)
         self.feishu_app_secret = os.environ.get("FEISHU_APP_SECRET", self.feishu_app_secret)
@@ -151,6 +161,16 @@ class Settings:
             self.session_ttl = int(os.environ.get("SESSION_TTL", str(self.session_ttl)))
         except ValueError:
             self.session_ttl = 43200
+
+        # 短期记忆保留策略（可选环境变量覆盖）
+        try:
+            self.short_memory_max_rounds = int(os.environ.get("SHORT_MEMORY_MAX_ROUNDS", str(self.short_memory_max_rounds)))
+        except ValueError:
+            self.short_memory_max_rounds = 50
+        try:
+            self.short_memory_ttl_days = int(os.environ.get("SHORT_MEMORY_TTL_DAYS", str(self.short_memory_ttl_days)))
+        except ValueError:
+            self.short_memory_ttl_days = 30
 
         # 运行时落库配置（扫码授权流写入）覆盖环境变量
         self._load_runtime()

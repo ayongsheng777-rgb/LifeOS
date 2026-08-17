@@ -52,11 +52,29 @@ class Expense(Base):
     happened_at: Mapped[str] = mapped_column(String(32))     # "YYYY-MM-DD"
 
 
+class PersonalFact(Base):
+    """个人长期事实库（永久记忆 A）：结构化事实，如『我今年用 XX 药好用』。
+
+    与短期/工作记忆不同，这里跨会话长期保留，并在每次对话时作为上下文注入，
+    让 AI 真正『记住』用户的偏好、健康、账号等稳定信息。
+    """
+    __tablename__ = "personal_facts"
+    id: Mapped[str] = mapped_column(String(12), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    created_at: Mapped[int] = mapped_column(BigInteger)
+    updated_at: Mapped[int] = mapped_column(BigInteger)
+    category: Mapped[str] = mapped_column(String(64), default="通用")
+    key: Mapped[str] = mapped_column(String(256))            # 简短标签，如「用药-2026」
+    value: Mapped[str] = mapped_column(Text)                # 事实内容
+    source: Mapped[str] = mapped_column(String(32), default="chat")  # chat | manual
+
+
 # name -> (ORM 模型, 业务列集合)
-_MODELS = {"todo": Todo, "expense": Expense}
+_MODELS = {"todo": Todo, "expense": Expense, "fact": PersonalFact}
 _COLS = {
     "todo": {"title", "done", "priority", "due", "done_at"},
     "expense": {"type", "amount", "category", "note", "happened_at"},
+    "fact": {"category", "key", "value", "source", "updated_at"},
 }
 
 
@@ -195,3 +213,55 @@ class PgStore:
             )
             await s.commit()
         return len(matched)
+
+
+# ===== 个人长期事实库（永久记忆 A）便捷接口 =====
+async def remember_fact(user_id: str, key: str, value: str,
+                        category: str = "通用", source: str = "chat") -> dict:
+    """写入/更新一条个人事实（按 user_id+key 幂等 upsert）。"""
+    if not settings.db_url:
+        raise RuntimeError("DB_URL 未配置：无法写入个人事实库")
+    sm = get_sessionmaker()
+    now = int(time.time())
+    async with sm() as s:
+        res = await s.execute(
+            select(PersonalFact).where(
+                PersonalFact.user_id == user_id, PersonalFact.key == key)
+        )
+        row = res.scalars().first()
+        if row:
+            row.value = value
+            row.category = category
+            row.source = source
+            row.updated_at = now
+            await s.commit()
+            await s.refresh(row)
+            return _fact_to_dict(row)
+        row = PersonalFact(
+            id=uuid.uuid4().hex[:12], user_id=user_id, created_at=now,
+            updated_at=now, category=category, key=key, value=value, source=source,
+        )
+        s.add(row)
+        await s.commit()
+        await s.refresh(row)
+        return _fact_to_dict(row)
+
+
+async def list_facts(user_id: str, limit: int = 50) -> list:
+    store = PgStore("fact")
+    items = await store.list_all(user_id)
+    items.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
+    return items[:limit]
+
+
+async def delete_fact(user_id: str, fact_id: str) -> bool:
+    store = PgStore("fact")
+    return await store.delete(user_id, fact_id)
+
+
+def _fact_to_dict(row) -> dict:
+    return {
+        "id": row.id, "user_id": row.user_id, "category": row.category,
+        "key": row.key, "value": row.value, "source": row.source,
+        "created_at": row.created_at, "updated_at": row.updated_at,
+    }

@@ -12,6 +12,7 @@
 - 多步编排步数封顶（MAX_PLAN_STEPS），单步异常不影响其它步。
 """
 import os
+import re
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -19,6 +20,7 @@ from typing import Any, Dict, List, Optional
 from app.skills.loader import SkillRegistry
 from app.memory import MemoryManager
 from app.ai import client
+from app.skills import db_store as db
 from app.ai.prompt import CHAT_SYSTEM, CLASSIFY_SYSTEM, PLAN_SYSTEM
 from app.config import settings
 
@@ -68,8 +70,16 @@ class AgentRouter:
             self.memory.clear_working(user_id)
             return "上下文已彻底清空，已为您准备好全新的干净运行环境。"
 
+        # 1.5 个人事实库写入（"记住 …" 指令，优先级高于意图分类）
+        fact_reply = await self._maybe_store_fact(user_id, message)
+        if fact_reply is not None:
+            self.memory.add_short(user_id, message, fact_reply)
+            return fact_reply
+
         # 2. 获取当前短期记忆（Redis 多轮历史）
         context = self.memory.get_short(user_id)
+        # 个人事实库（永久记忆 A）上下文块，供技能/编排分发时一并带上
+        fact_block = await self._build_fact_block(user_id)
 
         # 3. 意图识别（关键词快路 + AI 兜底）
         available_skills = self.skill_registry.get_available_skills()
@@ -88,21 +98,67 @@ class AgentRouter:
             skill_name = decision["skill"]
             self.memory.bump_skill(skill_name)
             skill = self.skill_registry.get_skill(skill_name)
+            enriched = self._enrich_context(context, fact_block)
             try:
-                response = await skill.execute(message, context, user_id=user_id)
+                response = await skill.execute(message, enriched, user_id=user_id)
             except Exception as e:
                 response = f"技能[{skill_name}]执行出错：{e}"
             # 技能返回 None → 交给 AI 默认对话（不卡死）
             if response is None:
                 response = await self._default_chat(message, context, user_id=user_id)
         elif decision["type"] == "multi_step":
-            response = await self._execute_multi_step(message, context, user_id)
+            response = await self._execute_multi_step(message, context, fact_block, user_id)
         else:
-            response = await self._default_chat(message, context)
+            response = await self._default_chat(message, context, user_id=user_id)
 
         # 6. 更新短期记忆
         self.memory.add_short(user_id, message, response)
         return response
+
+    # ===================== 个人事实库（永久记忆 A）=====================
+    async def _build_fact_block(self, user_id: str) -> str:
+        """读取个人事实库，拼成可读上下文块；失败返回空串（不阻断主流程）。"""
+        try:
+            facts = await db.list_facts(user_id, limit=20)
+            if not facts:
+                return ""
+            return "\n".join(f"- [{f['category']}] {f['key']}：{f['value']}" for f in facts)
+        except Exception as e:
+            log.warning("个人事实库读取失败（忽略）: %s", e)
+            return ""
+
+    @staticmethod
+    def _enrich_context(context: list, fact_block: str) -> list:
+        """把个人事实块作为 system 条目并入分发给技能/编排的上下文。"""
+        if not fact_block:
+            return context
+        return list(context) + [{"role": "system", "content": "[个人长期记忆]\n" + fact_block}]
+
+    async def _maybe_store_fact(self, user_id: str, message: str):
+        """识别『记住 …』指令，写入个人长期事实库。非此类指令返回 None。"""
+        m = message.strip()
+        for kw in ("记住了", "记住", "记一下", "记着", "记笔记", "备忘"):
+            if m.startswith(kw):
+                content = m[len(kw):].strip()
+                content = re.sub(r"^[:：\s]+", "", content)
+                if not content:
+                    return "你想让我记住什么？请说『记住：<内容>』，可选加分类如『健康|我今年用XX药好用』。"
+                # 可选分类：支持 "分类|内容" 或 "分类：内容"
+                category = "通用"
+                if "|" in content:
+                    cat, _, body = content.partition("|")
+                    category, content = (cat.strip() or "通用"), body.strip()
+                elif "：" in content:
+                    cat, _, body = content.partition("：")
+                    if body.strip():
+                        category, content = (cat.strip() or "通用"), body.strip()
+                try:
+                    fact = await db.remember_fact(user_id, content[:24], content,
+                                                 category=category, source="chat")
+                    return f"✅ 已记住（分类：{fact['category']}）：{fact['value']}"
+                except Exception as e:
+                    return f"⚠️ 记忆保存失败：{e}"
+        return None
 
     # ===================== V2：意图分类 =====================
     async def _classify_intent_v2(self, message: str, skills: list) -> Dict[str, Any]:
@@ -148,7 +204,7 @@ class AgentRouter:
         return None
 
     # ===================== V2：多步编排 =====================
-    async def _execute_multi_step(self, message: str, context: list, user_id: str) -> str:
+    async def _execute_multi_step(self, message: str, context: list, fact_block: str, user_id: str) -> str:
         """把请求拆成有序步骤（ai / skill 混合），逐一执行并汇总结果。
 
         规划失败 / AI 不可用 / 无步骤 → 回落默认对话；单步异常不影响其它步。
@@ -177,7 +233,7 @@ class AgentRouter:
                     if name and self.skill_registry.has_skill(name):
                         skill = self.skill_registry.get_skill(name)
                         arg = step.get("arg") or message
-                        out = await skill.execute(arg, context, user_id=user_id)
+                        out = await skill.execute(arg, self._enrich_context(context, fact_block), user_id=user_id)
                         if out is None:
                             out = f"（{name} 未返回结果）"
                         results.append(f"【步骤{i + 1}·{name}】{out}")
@@ -213,6 +269,14 @@ class AgentRouter:
             ctx_text = "\n".join(
                 [f"{'用户' if c['role'] == 'user' else '助手'}: {c['content']}" for c in context[-6:]]
             )
+        # 个人事实库（永久记忆 A）注入：让 AI 真正"记住"用户稳定信息
+        try:
+            facts = await db.list_facts(user_id, limit=20)
+            if facts:
+                fact_block = "\n".join(f"- [{f['category']}] {f['key']}：{f['value']}" for f in facts)
+                ctx_text = (ctx_text + "\n[个人长期记忆]\n" + fact_block) if ctx_text else ("[个人长期记忆]\n" + fact_block)
+        except Exception as e:
+            log.warning("个人事实库读取失败（忽略）: %s", e)
         # 长期记忆检索（可选：需 Qdrant 可用 + 已配置 EMBEDDING_MODEL；失败不影响主流程）
         lm = self.memory._ensure_long()
         if lm is not None:
@@ -246,6 +310,14 @@ class AgentRouter:
             ctx_text = "\n".join(
                 [f"{'用户' if c['role'] == 'user' else '助手'}: {c['content']}" for c in context[-6:]]
             )
+        # 个人事实库（永久记忆 A）注入
+        try:
+            facts = await db.list_facts(user_id, limit=20)
+            if facts:
+                fact_block = "\n".join(f"- [{f['category']}] {f['key']}：{f['value']}" for f in facts)
+                ctx_text = (ctx_text + "\n[个人长期记忆]\n" + fact_block) if ctx_text else ("[个人长期记忆]\n" + fact_block)
+        except Exception as e:
+            log.warning("个人事实库读取失败（忽略）: %s", e)
         lm = self.memory._ensure_long()
         if lm is not None:
             try:
@@ -287,6 +359,7 @@ class AgentRouter:
 
         # 2. 短期记忆 + 意图判定
         context = self.memory.get_short(user_id)
+        fact_block = await self._build_fact_block(user_id)
         available_skills = self.skill_registry.get_available_skills()
         decision = await self._classify_intent_v2(message, available_skills)
         try:
@@ -301,8 +374,9 @@ class AgentRouter:
             skill_name = decision["skill"]
             self.memory.bump_skill(skill_name)
             skill = self.skill_registry.get_skill(skill_name)
+            enriched = self._enrich_context(context, fact_block)
             try:
-                response = await skill.execute(message, context, user_id=user_id)
+                response = await skill.execute(message, enriched, user_id=user_id)
             except Exception as e:
                 response = f"技能[{skill_name}]执行出错：{e}"
             if response is None:
@@ -310,7 +384,7 @@ class AgentRouter:
             yield response
             self.memory.add_short(user_id, message, response)
         elif decision["type"] == "multi_step":
-            response = await self._execute_multi_step(message, context, user_id)
+            response = await self._execute_multi_step(message, context, fact_block, user_id)
             yield response
             self.memory.add_short(user_id, message, response)
         else:

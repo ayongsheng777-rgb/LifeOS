@@ -75,6 +75,7 @@ export const api = {
   // 对话
   chat: (message, user_id = 'me') =>
     request('POST', '/api/agent/chat', { message, user_id }),
+  history: () => request('GET', '/api/agent/history'),
 
   // 待办
   listTodos: () => request('GET', '/api/todos'),

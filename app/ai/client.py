@@ -330,17 +330,26 @@ async def embed(text: str, model: str = None, model_profile=None) -> list | None
 
     用于长期记忆（Qdrant）向量化；向量维度须与 VectorMemory 的 vector_size 一致（默认 1536）。
     """
-    mp = model_profile or settings.active_ai_profile()
     emb_model = model or settings.embedding_model
-    if mp is None or not getattr(mp, "api_key", ""):
-        return None
     if not emb_model:
         return None
-    base_url = mp.base_url.rstrip("/")
-    proxy = getattr(mp, "proxy", "") or settings.ai_proxy or None
-    headers = {"Authorization": f"Bearer {mp.api_key}", "Content-Type": "application/json"}
-    if getattr(mp, "user_agent", ""):
-        headers["User-Agent"] = mp.user_agent
+    # 优先使用独立的 embedding 端点配置（与聊天模型解耦）；否则回退到当前 AI profile
+    if settings.embedding_base_url and settings.embedding_api_key:
+        base_url = settings.embedding_base_url.rstrip("/")
+        api_key = settings.embedding_api_key
+        proxy = settings.ai_proxy or None
+        user_agent = ""
+    else:
+        mp = model_profile or settings.active_ai_profile()
+        if mp is None or not getattr(mp, "api_key", ""):
+            return None
+        base_url = mp.base_url.rstrip("/")
+        api_key = mp.api_key
+        proxy = getattr(mp, "proxy", "") or settings.ai_proxy or None
+        user_agent = getattr(mp, "user_agent", "")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if user_agent:
+        headers["User-Agent"] = user_agent
     try:
         async with _SEM:
             async with httpx.AsyncClient(proxy=proxy, timeout=httpx.Timeout(30)) as hc:

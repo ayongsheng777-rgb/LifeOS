@@ -30,7 +30,7 @@ from app.agent.router import agent_router, MessagePayload
 from app.skills.api_skill import (build_api_skills_into, write_skill_package,
                                   delete_skill_package, sanitize_skill_name,
                                   ApiSkillHandler)
-from app.skills.db_store import PgStore, init_db
+from app.skills.db_store import PgStore, init_db, remember_fact, list_facts, delete_fact
 from app.connector import connector
 
 # ===== 鉴权白名单（03-OTP：勿扩大）=====
@@ -118,7 +118,7 @@ async def security_headers(request: Request, call_next):
     resp = await call_next(request)
     resp.headers.setdefault(
         "Content-Security-Policy",
-        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; "
         "script-src 'self'; object-src 'none'; frame-ancestors 'none'",
     )
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -329,6 +329,42 @@ async def memory_long_delete(id: str = Query("", description="要删除的长期
     return {"ok": True}
 
 
+# ===== 个人长期事实库（永久记忆 A）端点 =====
+class FactReq(BaseModel):
+    key: str
+    value: str
+    category: str = "通用"
+    source: str = "manual"
+
+
+@app.post("/api/memory/fact")
+async def memory_fact_add(req: FactReq):
+    try:
+        fact = await remember_fact(DEFAULT_USER, req.key, req.value,
+                                   category=req.category, source=req.source)
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"error": f"保存失败：{e}"})
+    return {"ok": True, "fact": fact}
+
+
+@app.get("/api/memory/facts")
+async def memory_facts(limit: int = Query(50, ge=1, le=200)):
+    try:
+        items = await list_facts(DEFAULT_USER, limit=limit)
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"error": f"读取失败：{e}"})
+    return {"facts": items}
+
+
+@app.delete("/api/memory/fact/{fact_id}")
+async def memory_fact_del(fact_id: str):
+    try:
+        ok = await delete_fact(DEFAULT_USER, fact_id)
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"error": f"删除失败：{e}"})
+    return {"ok": ok}
+
+
 # ===== 调试/本地入口：直接对话 Agent（受 Bearer 保护）=====
 class ChatReq(BaseModel):
     message: str
@@ -352,6 +388,23 @@ async def agent_chat(req: ChatReq):
         MessagePayload(user_id="me", message=req.message, source="debug",
                        time=str(int(time.time()))))
     return {"reply": reply}
+
+
+@app.get("/api/agent/history")
+async def agent_history():
+    """返回当前用户的对话历史（短期记忆），供前端重新进入时自动恢复。
+
+    短期记忆存储格式为 {"role": "user"|"assistant", "content": str, "time": float}，
+    此处统一转换为前端友好的 {role, text}（assistant → ai）。
+    """
+    items = agent_router.memory.get_short(DEFAULT_USER)
+    messages = []
+    for it in items:
+        role = "user" if it.get("role") == "user" else "ai"
+        text = it.get("content") or it.get("text") or ""
+        if text:
+            messages.append({"role": role, "text": text})
+    return {"messages": messages}
 
 
 # ===== AI Gateway：模型健康自检 + 用量统计 + 流式对话 =====

@@ -11,9 +11,23 @@ from app.config import settings
 
 
 class ShortMemory:
-    def __init__(self, max_items: int = 20):
-        self.max_items = max_items
+    def __init__(self):
         self._r = None
+
+    def _max_items(self) -> int:
+        """最多保留的轮数（每轮=用户+AI 各1条）。可经环境变量覆盖。"""
+        try:
+            return max(1, int(getattr(settings, "short_memory_max_rounds", 50)))
+        except Exception:
+            return 50
+
+    def _ttl(self) -> int:
+        """Redis 过期秒数（天数×86400）。可经环境变量覆盖。"""
+        try:
+            days = max(1, int(getattr(settings, "short_memory_ttl_days", 30)))
+        except Exception:
+            days = 30
+        return days * 60 * 60 * 24
 
     def _conn(self):
         if self._r is None:
@@ -39,8 +53,8 @@ class ShortMemory:
                                     ensure_ascii=False))
             r.rpush(key, json.dumps({"role": "assistant", "content": response, "time": time.time()},
                                     ensure_ascii=False))
-            r.ltrim(key, -self.max_items * 2, -1)  # 只保留最近 N 轮
-            r.expire(key, 60 * 60 * 24 * 7)        # 7 天过期
+            r.ltrim(key, -self._max_items() * 2, -1)  # 只保留最近 N 轮
+            r.expire(key, self._ttl())               # 按配置天数保留
         except Exception:
             pass  # 记忆失败不阻断主流程
 
