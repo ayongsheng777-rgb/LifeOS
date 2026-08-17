@@ -135,4 +135,15 @@ export const api = {
   createSkillPackage: (payload) => request('POST', '/api/skills/package', payload),
   delSkillPackage: (name) => request('DELETE', `/api/skills/package/${encodeURIComponent(name)}`),
   reloadSkills: () => request('POST', '/api/skills/reload'),
+
+  // 数据备份
+  backupStatus: () => request('GET', '/api/backup/status'),
+  backupRun: () => request('POST', '/api/backup/run'),
+  backupConfig: () => request('GET', '/api/backup/config'),
+  updateBackupConfig: (payload) => request('POST', '/api/backup/config', payload),
+  backupPoints: (target) =>
+    request('GET', '/api/backup/points' + (target ? '?target=' + encodeURIComponent(target) : '')),
+  backupRestore: (payload) => request('POST', '/api/backup/restore', payload),
+  backupLog: (since = 0) =>
+    request('GET', '/api/backup/log' + (qs({ since }) ? '?' + qs({ since }) : '')),
 }

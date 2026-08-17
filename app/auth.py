@@ -23,7 +23,10 @@ from urllib.parse import quote
 import segno
 
 # ===== 常量与文件 =====
-DATA_DIR = os.environ.get("DATA_DIR", "./data")
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.environ.get("DATA_DIR") or os.path.join(_PROJECT_ROOT, "data")
+if not os.path.isabs(DATA_DIR):
+    DATA_DIR = os.path.join(_PROJECT_ROOT, DATA_DIR)
 OTP_ISSUER = os.environ.get("OTP_ISSUER", "LifeOS")
 OTP_ACCOUNT = os.environ.get("OTP_ACCOUNT", "admin@lifeos")
 SESSION_TTL = int(os.environ.get("SESSION_TTL", "43200"))  # 12h

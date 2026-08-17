@@ -71,7 +71,9 @@ class Settings:
     # ---- 基础设施 ----
     redis_url: str = "redis://redis:6379/0"
     qdrant_url: str = "http://127.0.0.1:6333"   # 后端为宿主进程，经 localhost 访问 Docker 内的 Qdrant
-    data_dir: str = "./data"
+    data_dir: str = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"
+    )
     db_url: str = ""   # Phase 1：PostgreSQL 连接串（postgresql+asyncpg://user:pw@host:port/db）；留空则待办/收支不可用
 
     # ---- AI（OpenAI 兼容）----
@@ -115,16 +117,25 @@ class Settings:
     # API 技能：纯配置驱动的 HTTP 调用技能（如高德地图），无需写代码即可新增。
     api_skills: list = field(default_factory=list)  # [dict] 字段约定见 upsert_api_skill
 
-    # ---- 数据突变备份（本地磁盘 + NAS）----
-    local_backup_root: str = "F:\\LifeOS_BAK"   # 本地备份根目录
-    nas_backup_root: str = ""                    # NAS 挂载目录（已挂载可写路径）；留空则不备份 NAS
+    # ---- 数据突变备份（多目标：本地磁盘 + NAS，协议 SMB/SFTP/FTP/WebDAV）----
+    # 每个目标为归一化后的完整结构：
+    #   {"type","method","host","port","share","directory","username","password",
+    #    "enabled","path"}
+    # 旧版 {path,enabled,type} 会在加载时经 normalize_target 自动迁移补全。
+    backup_targets: list = field(default_factory=list)
     backup_retention_days: int = 7               # 每个目标保留最近 N 天
     backup_schedule_hour: int = 3                # 每日定时备份时刻（0-23，默认凌晨 3 点）
+    # 兼容旧版单字段（迁移用，新面板不再直接编辑）
+    local_backup_root: str = ""   # 旧：本地备份根目录
+    nas_backup_root: str = ""     # 旧：NAS 备份根目录
 
     def load_env(self) -> None:
         self.redis_url = os.environ.get("REDIS_URL", self.redis_url)
         self.qdrant_url = os.environ.get("QDRANT_URL", self.qdrant_url)
-        self.data_dir = os.environ.get("DATA_DIR", self.data_dir)
+        env_data = os.environ.get("DATA_DIR")
+        if env_data:
+            _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            self.data_dir = env_data if os.path.isabs(env_data) else os.path.join(_root, env_data)
         self.db_url = os.environ.get("DB_URL", self.db_url)
 
         self.ai_enabled = os.environ.get("AI_ENABLED", "false").lower() in ("1", "true", "yes", "on")
@@ -178,7 +189,7 @@ class Settings:
         except ValueError:
             self.short_memory_ttl_days = 30
 
-        # 数据突变备份（本地磁盘 + NAS）
+        # 数据突变备份（多目标）—— 旧字段兼容；新架构以 backup_targets 为准
         self.local_backup_root = os.environ.get("LOCAL_BACKUP_ROOT", self.local_backup_root)
         self.nas_backup_root = os.environ.get("NAS_BACKUP_ROOT", self.nas_backup_root)
         try:
@@ -189,6 +200,17 @@ class Settings:
             self.backup_schedule_hour = int(os.environ.get("BACKUP_SCHEDULE_HOUR", str(self.backup_schedule_hour)))
         except ValueError:
             self.backup_schedule_hour = 3
+        # 默认种子：若尚未配置任何目标，按 LOCAL_BACKUP_ROOT / NAS_BACKUP_ROOT 或 F:\LifeOS_BAK 建目标。
+        # 每个目标带 type 字段（local=本地磁盘 / nas=NAS 共享），前端据此区分展示与提示。
+        if not self.backup_targets:
+            tgs = []
+            if self.local_backup_root:
+                tgs.append({"path": self.local_backup_root, "enabled": True, "type": "local"})
+            if self.nas_backup_root:
+                tgs.append({"path": self.nas_backup_root, "enabled": True, "type": "nas"})
+            if not tgs:
+                tgs = [{"path": "F:\\LifeOS_BAK", "enabled": True, "type": "local"}]
+            self.backup_targets = tgs
 
         # 运行时落库配置（扫码授权流写入）覆盖环境变量
         self._load_runtime()
@@ -206,14 +228,29 @@ class Settings:
             return
         for k in ("feishu_app_id", "feishu_app_secret", "feishu_enabled",
                   "feishu_trusted_bots", "feishu_admin_users", "ai_enabled",
-                  "ai_models", "ai_active", "scenario_models", "api_skills"):
+                  "ai_models", "ai_active", "scenario_models", "api_skills",
+                  "backup_targets",
+                  "backup_retention_days", "backup_schedule_hour"):
             if k in data:
                 setattr(self, k, data[k])
+        # 旧字段（local_backup_root / nas_backup_root）迁移到 backup_targets（带 type 区分）
+        if not self.backup_targets:
+            tgs = []
+            if data.get("local_backup_root"):
+                tgs.append({"path": data["local_backup_root"], "enabled": True, "type": "local"})
+            if data.get("nas_backup_root"):
+                tgs.append({"path": data["nas_backup_root"], "enabled": True, "type": "nas"})
+            if tgs:
+                self.backup_targets = tgs
+        # 归一化：旧版 {path,enabled} 自动补全为含 method/host 等的完整结构
+        self._normalize_backup_targets()
 
     def _save_runtime(self) -> None:
         keep = ("feishu_app_id", "feishu_app_secret", "feishu_enabled",
                 "feishu_trusted_bots", "feishu_admin_users", "ai_enabled",
-                "ai_models", "ai_active", "scenario_models", "api_skills")
+                "ai_models", "ai_active", "scenario_models", "api_skills",
+                "backup_targets",
+                "backup_retention_days", "backup_schedule_hour")
         snap = {k: getattr(self, k) for k in keep}
         try:
             with open(self._runtime_path(), "w", encoding="utf-8") as f:
@@ -228,7 +265,26 @@ class Settings:
             if isinstance(v, str) and v.startswith("****") and hasattr(self, k):
                 continue
             setattr(self, k, v)
+        # 备份目标保存后归一化（补全 method/path 等派生字段）
+        if "backup_targets" in data:
+            self._normalize_backup_targets()
         self._save_runtime()
+
+    def _normalize_backup_targets(self) -> None:
+        """把 backup_targets 中每个目标归一化为含 method/host 等的完整结构（幂等，失败不抛）。"""
+        if not self.backup_targets:
+            return
+        try:
+            from app.backup import normalize_target
+        except Exception:
+            return
+        out = []
+        for t in self.backup_targets:
+            try:
+                out.append(normalize_target(t))
+            except Exception:
+                out.append(t)
+        self.backup_targets = out
 
     def apply_overrides(self, **kw) -> None:
         """免重启热更新（扫码授权成功后调用）。"""

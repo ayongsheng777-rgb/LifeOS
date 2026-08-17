@@ -5,11 +5,16 @@
 - OTP（TOTP + 会话令牌）按《复刻指导 03》实现，纯标准库
 """
 import os
+import re
 import json
 import asyncio
 import time
 import hmac
 import httpx
+import datetime
+import logging
+import threading
+from collections import deque
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -32,7 +37,92 @@ from app.skills.api_skill import (build_api_skills_into, write_skill_package,
                                   ApiSkillHandler)
 from app.skills.db_store import PgStore, init_db, remember_fact, list_facts, delete_fact
 from app.connector import connector
-from app.backup import run_backup_all, start_backup_scheduler, stop_backup_scheduler, is_scheduler_running
+from app.backup import (run_backup_all, start_backup_scheduler, stop_backup_scheduler,
+                      is_scheduler_running, list_backup_points, run_restore, VALID_COMPONENTS,
+                      normalize_target)
+
+# ===== 备份实时日志收集（供 Web 面板 /api/backup/log 轮询）=====
+_logger = logging.getLogger("lifeos.main")
+
+_backup_log_buf = deque(maxlen=1000)
+_backup_log_lock = threading.Lock()
+_backup_log_seq = {"n": 0}
+
+
+class _BackupLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+        except Exception:
+            msg = record.getMessage()
+        with _backup_log_lock:
+            _backup_log_seq["n"] += 1
+            _backup_log_buf.append({
+                "id": _backup_log_seq["n"],
+                "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                "level": record.levelname,
+                "msg": msg,
+            })
+
+
+_bk_logger = logging.getLogger("lifeos.backup")
+_bk_handler = _BackupLogHandler()
+_bk_handler.setFormatter(logging.Formatter("%(message)s"))
+_bk_logger.addHandler(_bk_handler)
+
+
+def restart_backup_scheduler():
+    """停止旧的备份定时调度线程，用最新 settings 重新拉起（配置热更新后调用）。"""
+    stop_backup_scheduler()
+    time.sleep(0.3)  # 等待旧线程退出
+    targets = [t for t in (settings.backup_targets or []) if t.get("enabled") and t.get("path")]
+    if targets:
+        start_backup_scheduler(targets, settings.backup_retention_days, settings.data_dir,
+                               settings.backup_schedule_hour)
+        _logger.info("备份定时调度已按新配置重启（%d 个启用目标，保留=%d天，定时=%02d:00）",
+                     len(targets), settings.backup_retention_days, settings.backup_schedule_hour)
+
+
+# ===== 备份目标辅助（归一化 / 密码遮罩 / 校验 / 按 path 定位）=====
+def _mask_targets(targets):
+    """返回带密码遮罩的目标列表（UI 用 type=password，不回传明文）。"""
+    out = []
+    for t in (targets or []):
+        n = normalize_target(t)
+        if n.get("password"):
+            n = dict(n)
+            n["password"] = "****"
+        out.append(n)
+    return out
+
+
+def _resolve_target(identifier):
+    """按归一化 path 在已配置目标中定位并返回归一化目标（供 points/restore 使用）。"""
+    for t in (settings.backup_targets or []):
+        n = normalize_target(t)
+        if n["path"] == identifier:
+            return n
+    return None
+
+
+def _validate_target(n):
+    """按传输方式校验目标必填字段，返回错误字符串或 None。"""
+    m = n["method"]
+    if m == "local":
+        if not n["path"]:
+            return "本地目标需填写路径"
+    elif m == "smb":
+        if not n["host"] or not n["share"]:
+            return "SMB 需填写主机与共享名"
+        if not n["directory"]:
+            return "SMB 需填写远程目录"
+    elif m in ("sftp", "ftp", "webdav"):
+        if not n["host"]:
+            return f"{m.upper()} 需填写主机"
+        if not n["directory"]:
+            return f"{m.upper()} 需填写远程目录"
+    return None
+
 
 # ===== 鉴权白名单（03-OTP：勿扩大）=====
 PUBLIC_EXACT = {"/api/health", "/api/connector/webhook"}
@@ -82,10 +172,10 @@ async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
     if settings.feishu_enabled and settings.feishu_app_id and settings.feishu_app_secret:
         start_bot(loop)
-    # 启动：数据突变备份定时调度（每日 backup_schedule_hour，本地+NAS）
-    if settings.local_backup_root:
-        start_backup_scheduler(settings.local_backup_root, settings.nas_backup_root,
-                               settings.backup_retention_days, settings.data_dir,
+    # 启动：数据突变备份定时调度（每日 backup_schedule_hour，多目标：本地+NAS）
+    targets = [t for t in (settings.backup_targets or []) if t.get("enabled") and t.get("path")]
+    if targets:
+        start_backup_scheduler(targets, settings.backup_retention_days, settings.data_dir,
                                settings.backup_schedule_hour)
     yield
     # 关停
@@ -414,17 +504,16 @@ async def agent_history():
     return {"messages": messages}
 
 
-# ===== 数据突变备份（本地磁盘 + NAS）=====
+# ===== 数据突变备份（多目标：本地磁盘 + 多个 NAS 挂载点）=====
 @app.post("/api/backup/run")
 async def backup_run():
-    """手动触发一次全目标备份（本地+NAS）。数据导出在后台线程执行，不阻塞请求。"""
-    if not settings.local_backup_root:
+    """手动触发一次全目标备份（所有启用目标）。数据导出在后台线程执行，不阻塞请求。"""
+    targets = [t for t in (settings.backup_targets or []) if t.get("enabled") and t.get("path")]
+    if not targets:
         return JSONResponse(status_code=400,
-                            content={"error": "未配置备份根目录（LOCAL_BACKUP_ROOT）"})
+                            content={"error": "未配置任何启用的备份目标"})
     summary = await asyncio.to_thread(
-        run_backup_all,
-        settings.local_backup_root, settings.nas_backup_root,
-        settings.backup_retention_days, settings.data_dir,
+        run_backup_all, targets, settings.backup_retention_days, settings.data_dir,
     )
     return summary
 
@@ -432,26 +521,155 @@ async def backup_run():
 @app.get("/api/backup/status")
 async def backup_status():
     """返回上次备份状态（各目标 manifest 概要）、当前配置。"""
-    targets = [t for t in (settings.local_backup_root, settings.nas_backup_root) if t]
+    targets = settings.backup_targets or []
+    cache_dir = os.path.join(settings.data_dir, "backup_status")
     out = []
     for t in targets:
-        st = os.path.join(t, ".lifeos_backup_status.json")
+        n = normalize_target(t)
+        entry = dict(n)
+        if entry.get("password"):
+            entry["password"] = "****"
+        entry["last_backup"] = None
+        entry["results"] = None
+        st = os.path.join(cache_dir, re.sub(r'[^A-Za-z0-9._-]', '_', n["path"]) + ".json")
         if os.path.exists(st):
             try:
                 with open(st, "r", encoding="utf-8") as f:
-                    out.append(json.load(f))
-                continue
+                    loaded = json.load(f)
+                entry["last_backup"] = loaded.get("last_backup")
+                entry["results"] = loaded.get("results")
             except Exception:
                 pass
-        out.append({"target": t, "last_backup": None})
+        out.append(entry)
     return {
         "targets": out,
-        "local_root": settings.local_backup_root,
-        "nas_root": settings.nas_backup_root,
+        "backup_targets": _mask_targets(targets),
         "retention_days": settings.backup_retention_days,
         "schedule_hour": settings.backup_schedule_hour,
         "scheduler_running": is_scheduler_running(),
     }
+
+
+# ===== 备份配置读写（Web 面板在线编辑，runtime.json 落库，热重启调度）=====
+@app.get("/api/backup/config")
+async def backup_config_view():
+    """返回当前备份配置（供面板编辑表单初始化）。密码以 **** 遮罩。"""
+    return {
+        "backup_targets": _mask_targets(settings.backup_targets),
+        "backup_retention_days": settings.backup_retention_days,
+        "backup_schedule_hour": settings.backup_schedule_hour,
+    }
+
+
+class BackupConfigReq(BaseModel):
+    backup_targets: Optional[list] = None
+    backup_retention_days: Optional[int] = None
+    backup_schedule_hour: Optional[int] = None
+
+
+@app.post("/api/backup/config")
+async def backup_config_update(req: BackupConfigReq):
+    """在线更新备份配置（多目标列表，含 SMB/SFTP/FTP/WebDAV）：落库并热重启定时调度。"""
+    patch = {}
+    if req.backup_targets is not None:
+        if not isinstance(req.backup_targets, list):
+            return JSONResponse(status_code=400, content={"error": "备份目标必须是数组"})
+        # 已存目标按归一化 path 建索引，供密码占位符时找回原密码
+        existing = {normalize_target(t)["path"]: t for t in (settings.backup_targets or [])}
+        tgs = []
+        for i, t in enumerate(req.backup_targets):
+            if not isinstance(t, dict):
+                return JSONResponse(status_code=400, content={"error": f"第 {i + 1} 个目标格式错误"})
+            # 密码占位符 ****：保留已存密码，不覆盖
+            pw = t.get("password")
+            if isinstance(pw, str) and pw.startswith("****"):
+                cand = normalize_target({k: v for k, v in t.items() if k != "password"})
+                prev = existing.get(cand["path"])
+                if prev:
+                    t = dict(t)
+                    t["password"] = prev.get("password", "")
+            try:
+                n = normalize_target(t)
+            except Exception as e:
+                return JSONResponse(status_code=400, content={"error": f"第 {i + 1} 个目标解析失败：{e}"})
+            err = _validate_target(n)
+            if err:
+                return JSONResponse(status_code=400, content={"error": f"第 {i + 1} 个目标：{err}"})
+            if not n["path"]:
+                return JSONResponse(status_code=400, content={"error": f"第 {i + 1} 个目标路径为空"})
+            tgs.append(n)
+        if not tgs:
+            return JSONResponse(status_code=400, content={"error": "至少需要一个备份目标"})
+        patch["backup_targets"] = tgs
+    if req.backup_retention_days is not None:
+        try:
+            d = int(req.backup_retention_days)
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=400, content={"error": "保留天数必须是数字"})
+        if d < 1 or d > 365:
+            return JSONResponse(status_code=400, content={"error": "保留天数需在 1-365 之间"})
+        patch["backup_retention_days"] = d
+    if req.backup_schedule_hour is not None:
+        try:
+            h = int(req.backup_schedule_hour)
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=400, content={"error": "定时小时必须是数字"})
+        if h < 0 or h > 23:
+            return JSONResponse(status_code=400, content={"error": "定时小时需在 0-23 之间"})
+        patch["backup_schedule_hour"] = h
+    if not patch:
+        return JSONResponse(status_code=400, content={"error": "无可更新字段"})
+    settings.upsert_setting(patch)  # 内部会再次归一化（幂等）
+    restart_backup_scheduler()
+    return {"ok": True, "backup_targets": _mask_targets(patch["backup_targets"]),
+            "backup_retention_days": getattr(settings, "backup_retention_days", None),
+            "backup_schedule_hour": getattr(settings, "backup_schedule_hour", None)}
+
+
+@app.get("/api/backup/points")
+async def backup_points(target: str = Query("", description="备份目标 path（归一化后的稳定主键）")):
+    """列出某目标下所有可用备份时间点（含各组件可用性）。远程目标经传输层读取。"""
+    if not target:
+        return JSONResponse(status_code=400, content={"error": "需提供 target 参数"})
+    n = _resolve_target(target)
+    if not n:
+        return JSONResponse(status_code=400, content={"error": "该目标未配置"})
+    points = await asyncio.to_thread(list_backup_points, n, settings.data_dir)
+    return {"target": target, "points": points}
+
+
+class BackupRestoreReq(BaseModel):
+    target: str
+    timestamp: str
+    components: list   # 子集：["postgres","redis","qdrant","data"]
+
+
+@app.post("/api/backup/restore")
+async def backup_restore(req: BackupRestoreReq):
+    """还原指定目标/时间点的部分或全部组件（危险操作，前端二次确认后调用）。"""
+    n = _resolve_target(req.target)
+    if not n:
+        return JSONResponse(status_code=400, content={"error": "该目标未配置"})
+    comps = [c for c in (req.components or []) if c in VALID_COMPONENTS]
+    if not comps:
+        return JSONResponse(status_code=400, content={"error": "未选择有效还原组件"})
+    if not req.timestamp:
+        return JSONResponse(status_code=400, content={"error": "未指定备份时间点"})
+    try:
+        summary = await asyncio.to_thread(
+            run_restore, n, req.timestamp, comps, settings.data_dir)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"还原失败：{e}"})
+    return summary
+
+
+@app.get("/api/backup/log")
+async def backup_log_view(since: int = 0):
+    """轮询备份实时日志；since 为上一条日志 id，返回其后的新日志。"""
+    with _backup_log_lock:
+        items = [x for x in _backup_log_buf if x["id"] > since]
+        last_id = _backup_log_buf[-1]["id"] if _backup_log_buf else 0
+    return {"logs": items, "last_id": last_id}
 
 
 # ===== AI Gateway：模型健康自检 + 用量统计 + 流式对话 =====
