@@ -27,7 +27,7 @@ logger = logging.getLogger("lifeos.backup")
 PG_CONTAINER = "lifeos-postgres"
 PG_USER = "lifeos"
 PG_DB = "lifeos"
-PG_PASSWORD = os.environ.get("LIFEOS_DB_PW", "lifeos_pg_2026")
+PG_PASSWORD = os.environ.get("LIFEOS_DB_PW")  # 缺失即 None；实际备份时再校验（不在此处 raise，避免阻断应用启动）
 
 REDIS_CONTAINER = "lifeos-redis"
 QDRANT_CONTAINER = "lifeos-qdrant"
@@ -60,6 +60,8 @@ def _ts() -> str:
 
 def _backup_postgres(run_dir, ts):
     """pg_dump 自定义格式，经 stdout 落盘。"""
+    if not PG_PASSWORD:
+        raise RuntimeError("LIFEOS_DB_PW 未配置，无法备份 PostgreSQL（拒绝使用硬编码兜底密码）")
     out = os.path.join(run_dir, f"lifeos-pg-{ts}.dump")
     r = _docker_exec(PG_CONTAINER, ["pg_dump", "-U", PG_USER, "-d", PG_DB, "-F", "c"],
                      extra_env={"PGPASSWORD": PG_PASSWORD})
@@ -101,12 +103,29 @@ def _backup_qdrant(run_dir, ts):
     return os.path.getsize(out)
 
 
+# 备份打包 data/ 时排除的敏感文件（密钥与运行时配置）
+_SECRET_EXCLUDE = {"otp_secret", "session_secret", "settings_runtime.json"}
+
+
 def _backup_data_dir(run_dir, ts, data_dir):
-    """打包 data/ 配置目录（OTP 密钥、运行时设置等）。用 shutil 保证跨平台。"""
+    """打包 data/ 配置目录，但排除密钥与运行时配置明文文件。"""
     if not data_dir or not os.path.isdir(data_dir):
         return None
     base = os.path.join(run_dir, f"lifeos-data-{ts}")
-    archive = shutil.make_archive(base, "gztar", root_dir=data_dir)
+    archive = base + ".tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        for root, _dirs, files in os.walk(data_dir):
+            for f in files:
+                if f in _SECRET_EXCLUDE:
+                    continue
+                full = os.path.join(root, f)
+                rel = os.path.relpath(full, data_dir)
+                try:
+                    tf.add(full, arcname=rel)
+                except OSError:
+                    continue
+    if not os.path.exists(archive):
+        return None
     return os.path.getsize(archive)
 
 
@@ -303,13 +322,22 @@ class _SftpDest(BackupDest):
     def _connect(self):
         import paramiko
         self._ssh = paramiko.SSHClient()
-        self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # 首次连接固化主机密钥到 known_hosts；之后强制校验，防中间人
+        kh = os.path.join(self._data_dir, "known_hosts")
+        if os.path.exists(kh):
+            self._ssh.load_host_keys(kh)
+            self._ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+        else:
+            self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         kw = {"hostname": self.norm["host"], "port": self.norm["port"] or 22, "timeout": 20}
         if self.norm.get("username"):
             kw["username"] = self.norm["username"]
         if self.norm.get("password"):
             kw["password"] = self.norm["password"]
         self._ssh.connect(**kw)
+        if not os.path.exists(kh):
+            os.makedirs(os.path.dirname(kh), exist_ok=True)
+            self._ssh.save_host_keys(kh)
         self._sftp = self._ssh.open_sftp()
 
     def _remote(self, ts, rel_name):

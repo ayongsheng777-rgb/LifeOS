@@ -215,6 +215,30 @@ class FeishuBotService:
             await self._cmd_ingest_news(open_id, raw, chat_id)
             return
 
+        # ===== AI 自救 / 模型管理指令（纯程序，不依赖 AI 可用）=====
+        if text_lower.startswith("/ai_fix") or text_lower.startswith("/nvidia"):
+            from app.ai.client import _failover_rescue
+            try:
+                switched = await _failover_rescue()
+            except Exception as e:
+                switched = False
+                log.error("飞书触发 AI 自救异常: %s", e)
+            reply = ("✅ AI 模型已切换/尝试完成，请稍候查看飞书推送确认。"
+                     if switched else "❌ 未找到可用替代模型（详见后端日志）")
+            await self._send_text(chat_id, reply)
+            return
+
+        if text_lower.startswith("/models"):
+            active = settings.active_ai_profile()
+            info = (f"当前: {active.model if active else '无'} "
+                    f"({active.base_url if active else '-'})\n")
+            info += f"模型库共 {len(settings.ai_models)} 个：\n"
+            for m in settings.ai_models:
+                mark = "★" if m.get("id") == settings.ai_active else " "
+                info += f"{mark} {m.get('model', '?')} [{m.get('id', '?')}]\n"
+            await self._send_text(chat_id, info.strip())
+            return
+
         # 兜底：交给 Agent（最终路由到 AI 默认对话 / Skill）
         try:
             reply = await agent_router.process_message(
@@ -455,8 +479,11 @@ class FeishuBotService:
             return 0
         ok = 0
         for uid in users:
+            # open_id 以 "ou_" 开头；用 open_id 类型发送，避免被当成 employee_id
+            # 而要求 contact:user.employee_id:readonly 范围（应用通常未授权）。
+            id_type = "open_id" if str(uid).startswith("ou_") else "user_id"
             try:
-                if await self._send_text(uid, text, id_type="user_id"):
+                if await self._send_text(uid, text, id_type=id_type):
                     ok += 1
             except Exception as e:
                 log.warning("飞书推送失败 %s: %s", uid, e)

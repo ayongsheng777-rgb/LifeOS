@@ -9,6 +9,7 @@ Phase 4 增强：
 - 流式：chat_stream 异步生成器，逐块吐字（SSE 由端点封装）。
 """
 import json
+import os
 import time
 import asyncio
 import logging
@@ -218,7 +219,26 @@ async def chat(system: str = None, user: str = "", *, model_profile=None,
         last_status = status
         await _record_usage(user_id, model=mp.model, scenario=scenario,
                             latency_ms=latency_ms, ok=False, error=str(status))
-    log.warning("所有候选模型均失败（最后状态 %s），返回 None", last_status)
+    log.warning("所有候选模型均失败（最后状态 %s），启动纯程序降级", last_status)
+    # 【纯程序降级】不走 AI，纯代码自救（飞书通知→探 NVIDIA→切/回退 DeepSeek）
+    try:
+        switched = await _failover_rescue(user_id=user_id, scenario=scenario)
+    except Exception as e:
+        log.error("降级自救异常: %s", e)
+        switched = False
+    if switched:
+        # 降级成功：用新模型只重试一次（避免递归死循环）
+        retry_mp = settings.active_ai_profile()
+        if retry_mp:
+            content, status, usage = await _call_once(
+                retry_mp, system, user, temperature=temperature,
+                max_tokens=max_tokens, json_mode=json_mode,
+                proxy=(getattr(retry_mp, "proxy", "") or settings.ai_proxy or None),
+                timeout=timeout, cache_ttl=cache_ttl,
+            )
+            if content is not None:
+                log.info("降级重试成功: model=%s", retry_mp.model)
+                return content
     return None
 
 
@@ -500,3 +520,99 @@ async def speed_test(model_profile=None, rounds: int = 3, require_enabled: bool 
         }
     return {"ok": bool(ok_rounds), "model": model, "rounds": results, "avg": avg,
             "success": len(ok_rounds), "total": rounds}
+
+
+# ===================== 纯程序降级自救（AI 全挂时触发）=====================
+async def _failover_rescue(*, user_id: str = "me", scenario: str = "chat") -> bool:
+    """AI 全部候选失败后的纯程序自救：飞书通知 → 探 NVIDIA → 切模型 → 再通知。
+
+    全程不调用任何 AI 能力（因为 AI 已经挂了）。返回是否成功切换了模型。
+    """
+    from app.config import _is_valid_key
+    from app.feishu import bot
+    from .nvidia_probe import auto_best, ensure_nvidia_in_models
+
+    # ① 飞书通知：AI 全挂了，正在自救
+    try:
+        await bot.push_to_users(
+            settings.feishu_admin_users,
+            "⚠️ LifeOS AI 全部模型调用失败，正在启动纯程序自救...",
+        )
+    except Exception:
+        pass  # 飞书也挂就跳过
+
+    # ② 尝试 NVIDIA 探测与切换
+    nvidia_key = _find_nvidia_key()
+    if nvidia_key:
+        try:
+            await ensure_nvidia_in_models(nvidia_key)
+            best = await auto_best(nvidia_key)
+            if best:
+                old_active = settings.ai_active
+                # 更新 nvidia-auto 条目的具体模型名（持久化）
+                for m in settings.ai_models:
+                    if m.get("id") == "nvidia-auto":
+                        m["model"] = best["id"]
+                        settings.upsert_ai_model(m)
+                        break
+                settings.set_active_ai_model("nvidia-auto")
+                try:
+                    await bot.push_to_users(
+                        settings.feishu_admin_users,
+                        f"✅ AI 自救完成：{old_active} → {best['id']} "
+                        f"(NVIDIA, {best['latency_ms']}ms)",
+                    )
+                except Exception:
+                    pass
+                log.info("降级成功: → NVIDIA %s", best["id"])
+                return True
+        except Exception as e:
+            log.error("NVIDIA 降级异常: %s", e)
+
+    # ③ NVIDIA 没用 → 切 DeepSeek 备用
+    deepseek = _find_deepseek_fallback()
+    if deepseek:
+        old_active = settings.ai_active
+        settings.set_active_ai_model(deepseek["id"])
+        try:
+            await bot.push_to_users(
+                settings.feishu_admin_users,
+                f"⚡ AI 降级至备用：{old_active} → {deepseek.get('model')} (DeepSeek)",
+            )
+        except Exception:
+            pass
+        log.info("降级至 DeepSeek: %s", deepseek["id"])
+        return True
+
+    # ④ 彻底没救
+    try:
+        await bot.push_to_users(
+            settings.feishu_admin_users,
+            "❌ AI 自救失败：NVIDIA 与 DeepSeek 均不可用，请手动检查模型配置",
+        )
+    except Exception:
+        pass
+    return False
+
+
+def _find_nvidia_key() -> str | None:
+    """从模型库找 NVIDIA API key；未配置则退到环境变量 NVIDIA_API_KEY。"""
+    from app.config import _is_valid_key
+    for m in settings.ai_models:
+        if "integrate.api.nvidia.com" in m.get("base_url", ""):
+            k = m.get("api_key", "")
+            if _is_valid_key(k):
+                return k
+    env_key = os.environ.get("NVIDIA_API_KEY", "")
+    return env_key if _is_valid_key(env_key) else None
+
+
+def _find_deepseek_fallback() -> dict | None:
+    """从模型库找 DeepSeek 备用（非当前 active、且 key 有效）。"""
+    from app.config import _is_valid_key
+    for m in settings.ai_models:
+        if ("deepseek" in m.get("base_url", "").lower()
+                or "deepseek" in m.get("model", "").lower()):
+            if m.get("id") != settings.ai_active and _is_valid_key(m.get("api_key", "")):
+                return m
+    return None

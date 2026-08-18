@@ -20,12 +20,13 @@ CHAT_SYSTEM = (
 CLASSIFY_SYSTEM = (
     "你是 LifeOS 的意图分类器。系统会在用户消息后附上『可用技能列表』。\n"
     "请判断用户意图类别，只输出 JSON：\n"
-    "{\"type\": \"skill\"|\"multi_step\"|\"chat\", \"skill\": \"<技能名或 null>\", \"reason\": \"<一句话>\"}\n"
+    "{\"type\": \"skill\"|\"multi_step\"|\"chat\"|\"reminder\", \"skill\": \"<技能名或 null>\", \"reason\": \"<一句话>\"}\n"
     "规则：\n"
     "1. 若消息明显对应某个技能（关键词命中或语义明确属于其职责），type=skill 且 skill=该名称。\n"
     "2. 若消息需要多个动作/步骤协同完成（例如既要记待办又要查账单），type=multi_step。\n"
-    "3. 其它（闲聊、提问、意图不明）type=chat。\n"
-    "4. 不确定就给 chat，不要硬套技能。"
+    "3. 若消息是『未来要做/要回访』的事（欠钱要还、某日到期、健康回访、提醒我做某事），type=reminder。\n"
+    "4. 其它（闲聊、提问、意图不明）type=chat。\n"
+    "5. 不确定就给 chat，不要硬套技能。"
 )
 
 # ===== V2 多步任务编排（Agent 路由）=====

@@ -16,7 +16,7 @@ import time
 import uuid
 from typing import Optional
 
-from sqlalchemy import String, BigInteger, Boolean, Numeric, Text, select, delete
+from sqlalchemy import String, BigInteger, Integer, Boolean, Numeric, Text, select, delete
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
@@ -67,6 +67,23 @@ class PersonalFact(Base):
     key: Mapped[str] = mapped_column(String(256))            # 简短标签，如「用药-2026」
     value: Mapped[str] = mapped_column(Text)                # 事实内容
     source: Mapped[str] = mapped_column(String(32), default="chat")  # chat | manual
+
+
+class Reminder(Base):
+    """主动提醒引擎：到期/回访事件。调度器扫描后走飞书推送。"""
+    __tablename__ = "reminders"
+    id: Mapped[str] = mapped_column(String(12), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    created_at: Mapped[int] = mapped_column(BigInteger)
+    title: Mapped[str] = mapped_column(String(256))
+    detail: Mapped[str] = mapped_column(Text, default="")
+    due_at: Mapped[int] = mapped_column(BigInteger)               # 到期 epoch
+    advance_days: Mapped[int] = mapped_column(Integer, default=1)  # 提前几天提醒
+    repeat_interval_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # 回访间隔
+    repeat_remaining: Mapped[int] = mapped_column(Integer, default=0)  # 剩余回访次数
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/sent/done/cancelled
+    last_sent_at: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    source: Mapped[str] = mapped_column(String(16), default="chat")  # chat | manual
 
 
 # name -> (ORM 模型, 业务列集合)
@@ -265,3 +282,113 @@ def _fact_to_dict(row) -> dict:
         "key": row.key, "value": row.value, "source": row.source,
         "created_at": row.created_at, "updated_at": row.updated_at,
     }
+
+
+# ===== 提醒引擎存储 =====
+def _reminder_to_dict(row) -> dict:
+    return {
+        "id": row.id, "user_id": row.user_id, "created_at": row.created_at,
+        "title": row.title, "detail": row.detail, "due_at": row.due_at,
+        "advance_days": row.advance_days, "repeat_interval_days": row.repeat_interval_days,
+        "repeat_remaining": row.repeat_remaining, "status": row.status,
+        "last_sent_at": row.last_sent_at, "source": row.source,
+    }
+
+
+async def add_reminder(user_id: str, *, title: str, detail: str = "", due_at: int,
+                       advance_days: int = 1, repeat_interval_days=None,
+                       repeat_times: int = 0, source: str = "chat") -> dict:
+    if not settings.db_url:
+        raise RuntimeError("DB_URL 未配置：无法写入提醒")
+    sm = get_sessionmaker()
+    now = int(time.time())
+    row = Reminder(
+        id=uuid.uuid4().hex[:12], user_id=user_id, created_at=now,
+        title=title, detail=detail, due_at=int(due_at), advance_days=int(advance_days),
+        repeat_interval_days=repeat_interval_days, repeat_remaining=int(repeat_times or 0),
+        status="pending", source=source,
+    )
+    async with sm() as s:
+        s.add(row)
+        await s.commit()
+        await s.refresh(row)
+    return _reminder_to_dict(row)
+
+
+async def list_reminders(user_id: str, status: str = None) -> list:
+    sm = get_sessionmaker()
+    async with sm() as s:
+        q = select(Reminder).where(Reminder.user_id == user_id)
+        if status:
+            q = q.where(Reminder.status == status)
+        q = q.order_by(Reminder.due_at)
+        rows = (await s.execute(q)).scalars().all()
+    return [_reminder_to_dict(r) for r in rows]
+
+
+async def due_reminders(advance_window: bool = True) -> list:
+    """跨用户返回所有 pending 且已到提醒窗口的提醒（调度器用）。"""
+    sm = get_sessionmaker()
+    now = int(time.time())
+    async with sm() as s:
+        rows = (await s.execute(
+            select(Reminder).where(Reminder.status == "pending")
+        )).scalars().all()
+    out = []
+    for r in rows:
+        window = (r.due_at - r.advance_days * 86400) if advance_window else r.due_at
+        if now >= window:
+            out.append(_reminder_to_dict(r))
+    return out
+
+
+async def mark_reminder_sent(rid: str) -> bool:
+    sm = get_sessionmaker()
+    async with sm() as s:
+        r = await s.get(Reminder, rid)
+        if not r:
+            return False
+        r.status = "sent"
+        r.last_sent_at = int(time.time())
+        await s.commit()
+        return True
+
+
+async def mark_reminder_done(rid: str) -> bool:
+    """手动标记提醒为已完成（停止回访/取消未到期提醒），保留记录。"""
+    sm = get_sessionmaker()
+    async with sm() as s:
+        r = await s.get(Reminder, rid)
+        if not r:
+            return False
+        r.status = "done"
+        r.last_sent_at = int(time.time())
+        await s.commit()
+        return True
+
+
+async def reschedule_reminder(rid: str) -> bool:
+    sm = get_sessionmaker()
+    async with sm() as s:
+        r = await s.get(Reminder, rid)
+        if not r:
+            return False
+        step = (r.repeat_interval_days or 1) * 86400
+        r.due_at = r.due_at + step
+        r.repeat_remaining = max(0, r.repeat_remaining - 1)
+        r.last_sent_at = int(time.time())
+        if r.repeat_remaining <= 0:
+            r.status = "done"
+        await s.commit()
+        return True
+
+
+async def delete_reminder(user_id: str, rid: str) -> bool:
+    sm = get_sessionmaker()
+    async with sm() as s:
+        r = await s.get(Reminder, rid)
+        if not r or r.user_id != user_id:
+            return False
+        await s.delete(r)
+        await s.commit()
+        return True

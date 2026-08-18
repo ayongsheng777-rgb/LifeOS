@@ -35,7 +35,9 @@ from app.agent.router import agent_router, MessagePayload
 from app.skills.api_skill import (build_api_skills_into, write_skill_package,
                                   delete_skill_package, sanitize_skill_name,
                                   ApiSkillHandler)
-from app.skills.db_store import PgStore, init_db, remember_fact, list_facts, delete_fact
+from app.skills.db_store import (PgStore, init_db, remember_fact, list_facts,
+                                  delete_fact, add_reminder, list_reminders,
+                                  delete_reminder, mark_reminder_done)
 from app.connector import connector
 from app.backup import (run_backup_all, start_backup_scheduler, stop_backup_scheduler,
                       is_scheduler_running, list_backup_points, run_restore, VALID_COMPONENTS,
@@ -124,9 +126,11 @@ def _validate_target(n):
     return None
 
 
-# ===== 鉴权白名单（03-OTP：勿扩大）=====
-PUBLIC_EXACT = {"/api/health", "/api/connector/webhook"}
-PUBLIC_PREFIXES = ("/api/auth/",)
+# ===== 鉴权白名单（03-OTP：精确匹配，勿用前缀放行整个 /api/auth/）=====
+# 仅 setup/login/check 公开；logout 与 otp-reset 需已登录会话（otp-reset 还须当前动态码双因子）
+PUBLIC_EXACT = {"/api/health", "/api/connector/webhook",
+                "/api/auth/setup", "/api/auth/login", "/api/auth/check"}
+PUBLIC_PREFIXES = ()
 
 
 # ===== 登录暴力破解防护（P0-02，单进程内存限流；Redis 起后可升级为共享限流）=====
@@ -177,9 +181,14 @@ async def lifespan(app: FastAPI):
     if targets:
         start_backup_scheduler(targets, settings.backup_retention_days, settings.data_dir,
                                settings.backup_schedule_hour)
+    # 启动：主动提醒调度（扫描 reminders 表 → 飞书推送）
+    from app.reminder import start_reminder_scheduler
+    start_reminder_scheduler()
     yield
     # 关停
     stop_backup_scheduler()
+    from app.reminder import stop_reminder_scheduler
+    stop_reminder_scheduler()
     await stop_bot()
 
 
@@ -1164,6 +1173,15 @@ class ExpenseCreate(BaseModel):
     happened_at: Optional[str] = None
 
 
+class ReminderCreate(BaseModel):
+    title: str
+    detail: str = ""
+    due_at: int                                   # 到期时间 epoch 秒
+    advance_days: int = 1                         # 提前几天提醒
+    repeat_interval_days: Optional[int] = None    # 回访间隔；空=一次性
+    repeat_times: int = 0                         # 回访次数
+
+
 @app.get("/api/todos")
 async def list_todos():
     return {"items": await _todo_store.list_all(DEFAULT_USER)}
@@ -1236,6 +1254,68 @@ async def delete_expense(eid: str):
     if not ok:
         return JSONResponse(status_code=404, content={"error": "记录不存在"})
     return {"ok": True}
+
+
+# ===== 主动提醒引擎 API（B 部分：管理界面 / 手动创建）=====
+@app.get("/api/reminders")
+async def list_reminders_api(status: Optional[str] = None):
+    items = await list_reminders(DEFAULT_USER, status=status)
+    return {"items": items}
+
+
+@app.post("/api/reminders")
+async def create_reminder_api(req: ReminderCreate):
+    if req.due_at <= 0:
+        return JSONResponse(status_code=400, content={"error": "due_at 必须是有效的 epoch 秒"})
+    item = await add_reminder(
+        DEFAULT_USER, title=req.title[:256], detail=req.detail or "",
+        due_at=req.due_at, advance_days=req.advance_days,
+        repeat_interval_days=req.repeat_interval_days, repeat_times=req.repeat_times,
+        source="manual",
+    )
+    return item
+
+
+@app.post("/api/reminders/{rid}/done")
+async def done_reminder_api(rid: str):
+    ok = await mark_reminder_done(rid)
+    if not ok:
+        return JSONResponse(status_code=404, content={"error": "提醒不存在"})
+    return {"ok": True}
+
+
+@app.delete("/api/reminders/{rid}")
+async def delete_reminder_api(rid: str):
+    ok = await delete_reminder(DEFAULT_USER, rid)
+    if not ok:
+        return JSONResponse(status_code=404, content={"error": "提醒不存在"})
+    return {"ok": True}
+
+
+# ===== NVIDIA 自动探测 / 纯程序降级（Doc 12）=====
+@app.post("/api/ai/nvidia-probe")
+async def nvidia_probe_api():
+    """手动触发 NVIDIA 自动探测+切换（纯程序，不依赖 AI 可用）。"""
+    from app.ai.client import _failover_rescue
+    switched = await _failover_rescue()
+    return {"ok": bool(switched)}
+
+
+@app.get("/api/ai/nvidia-models")
+async def nvidia_list_models_api():
+    """查看 NVIDIA 当前可选免费模型列表（不切换）。"""
+    from app.ai.nvidia_probe import list_available_models
+    key = None
+    for m in settings.ai_models:
+        if "integrate.api.nvidia.com" in m.get("base_url", ""):
+            k = m.get("api_key", "")
+            if k:
+                key = k
+                break
+    if not key:
+        key = os.environ.get("NVIDIA_API_KEY", "")
+    models = await list_available_models(key) if key else []
+    return {"models": models, "count": len(models)}
 
 
 # ===== 配置查看 / 更新（供前端设置页）=====

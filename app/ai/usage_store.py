@@ -14,7 +14,7 @@ import uuid
 import logging
 from typing import Optional
 
-from sqlalchemy import String, BigInteger, Boolean, Numeric, Text, Integer, select
+from sqlalchemy import String, BigInteger, Boolean, Numeric, Text, Integer, select, func, Index, cast
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.skills.db_store import Base, get_sessionmaker
@@ -45,6 +45,10 @@ class AIUsage(Base):
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     ok: Mapped[bool] = mapped_column(Boolean, default=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_ai_usage_user_created", "user_id", "created_at"),
+    )
 
 
 class UsageStore:
@@ -114,33 +118,50 @@ class UsageStore:
             return []
 
     async def summary(self, user_id: str, since_ts: int = None) -> dict:
-        """汇总某用户用量；DB 不可用时返回空结构。"""
+        """汇总某用户用量（SQL 聚合下推，避免全表拉行）。DB 不可用时返回空结构。"""
         try:
             sm = get_sessionmaker()
         except RuntimeError:
             return self._empty()
         try:
-            async with sm() as s:
-                res = await s.execute(select(AIUsage).where(AIUsage.user_id == user_id))
-                rows = res.scalars().all()
+            base = select(AIUsage).where(AIUsage.user_id == user_id)
             if since_ts:
-                rows = [r for r in rows if r.created_at >= since_ts]
-            calls = len(rows)
-            ok_calls = sum(1 for r in rows if r.ok)
-            in_tok = sum(r.input_tokens for r in rows)
-            out_tok = sum(r.output_tokens for r in rows)
-            cost = sum(float(r.cost) for r in rows)
+                base = base.where(AIUsage.created_at >= since_ts)
+            sub = base.subquery()
+            async with sm() as s:
+                # 总览：单条聚合
+                tot = (await s.execute(
+                    select(func.count(),
+                           func.coalesce(func.sum(AIUsage.input_tokens), 0),
+                           func.coalesce(func.sum(AIUsage.output_tokens), 0),
+                           func.coalesce(func.sum(AIUsage.cost), 0.0),
+                           func.coalesce(func.sum(cast(AIUsage.ok, Integer)), 0))
+                    .select_from(sub)
+                )).first()
+                # 按模型分组：calls/tokens/cost
+                rows = (await s.execute(
+                    select(AIUsage.model, func.count(),
+                           func.coalesce(func.sum(AIUsage.input_tokens), 0),
+                           func.coalesce(func.sum(AIUsage.output_tokens), 0),
+                           func.coalesce(func.sum(AIUsage.cost), 0.0))
+                    .select_from(sub).group_by(AIUsage.model)
+                )).all()
+            calls = int(tot[0] or 0)
+            ok_calls = int(tot[4] or 0)
+            in_tok = int(tot[1] or 0)
+            out_tok = int(tot[2] or 0)
+            cost = round(float(tot[3] or 0), 6)
             per_model: dict = {}
-            for r in rows:
-                m = r.model or "unknown"
-                d = per_model.setdefault(m, {"calls": 0, "tokens": 0, "cost": 0.0})
-                d["calls"] += 1
-                d["tokens"] += r.input_tokens + r.output_tokens
-                d["cost"] = round(d["cost"] + float(r.cost), 6)
+            for m, c, it, ot, co in rows:
+                per_model[m or "unknown"] = {
+                    "calls": int(c),
+                    "tokens": int(it) + int(ot),
+                    "cost": round(float(co or 0), 6),
+                }
             return {
                 "calls": calls, "ok": ok_calls, "fail": calls - ok_calls,
                 "input_tokens": in_tok, "output_tokens": out_tok,
-                "total_tokens": in_tok + out_tok, "cost": round(cost, 6),
+                "total_tokens": in_tok + out_tok, "cost": cost,
                 "per_model": per_model,
             }
         except Exception as e:

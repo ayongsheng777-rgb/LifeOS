@@ -13,6 +13,8 @@
 """
 import os
 import re
+import time
+import datetime
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -23,6 +25,20 @@ from app.ai import client
 from app.skills import db_store as db
 from app.ai.prompt import CHAT_SYSTEM, CLASSIFY_SYSTEM, PLAN_SYSTEM
 from app.config import settings
+
+# 提醒意图提取（纯 JSON，系统给今天日期，避免模型瞎编）
+REMINDER_PROMPT = (
+    "你是 LifeOS 的提醒提取器。从用户的话里提取『未来要做/要回访』的事项，只输出 JSON：\n"
+    "{\"is_reminder\": true|false, \"title\": \"事项名\", \"detail\": \"细节(含金额/对象)\", "
+    "\"due_date\": \"YYYY-MM-DD\", \"advance_days\": 提前几天提醒(整数,默认1),\n"
+    " \"is_followup\": true|false, \"followup_days\": 回访间隔天数(默认1), "
+    "\"followup_times\": 回访次数(默认3)}\n"
+    "规则：\n"
+    "1. 含『要还/到期/欠/还钱/还款/借/催/提醒我』→ is_reminder=true，并填 due_date。\n"
+    "2. 含『头痛/头疼/不舒服/生病/难受』→ is_followup=true，followup_days=1，followup_times=3。\n"
+    "3. 『N年后还』请把 due_date 推算为具体日期（系统已给今天）。\n"
+    "4. 没有上述意图 → is_reminder=false 且 is_followup=false。"
+)
 
 log = logging.getLogger("lifeos.agent")
 
@@ -108,6 +124,8 @@ class AgentRouter:
                 response = await self._default_chat(message, context, user_id=user_id)
         elif decision["type"] == "multi_step":
             response = await self._execute_multi_step(message, context, fact_block, user_id)
+        elif decision["type"] == "reminder":
+            response = await self._handle_reminder(user_id, message, context)
         else:
             response = await self._default_chat(message, context, user_id=user_id)
 
@@ -167,12 +185,17 @@ class AgentRouter:
         返回 {"type": "skill"|"multi_step"|"chat", "skill": str|None}。
         任何异常 / AI 不可用 → 回落 chat（等价于原默认对话）。
         """
-        # ① 关键词快路：与旧版行为一致，零网络开销，先拦明显意图
+        # ① reminder 快路：明确是"未来要办/要回访"的事（零网络开销）。
+        #    放在技能匹配之前，避免"头痛/欠钱"等被 health_skill 等拦截而漏建提醒。
+        if self._reminder_keyword(message):
+            return {"type": "reminder", "skill": None}
+
+        # ② 关键词快路：与旧版行为一致，零网络开销，先拦明显意图
         kw_hit = self._keyword_match(message, skills)
         if kw_hit:
             return {"type": "skill", "skill": kw_hit}
 
-        # ② AI 兜底分类（需 AI 可用）
+        # ③ AI 兜底分类（需 AI 可用）
         if not client.available():
             return {"type": "chat", "skill": None}
         user_text = f"用户消息：{message}\n\n可用技能：\n{_format_skills(skills)}"
@@ -202,6 +225,107 @@ class AgentRouter:
                 if kw and kw.lower() in msg:
                     return sk["name"]
         return None
+
+    @staticmethod
+    def _reminder_keyword(message: str) -> bool:
+        """零开销快路：含债务/到期/健康回访/显式提醒 关键词即判为提醒意图。
+
+        健康回访需兼容口语插入字（如『头有点痛』『头很疼』），故 头+痛/疼
+        分字出现也判为回访意图，避免被 health_skill 拦截而漏建回访提醒。
+        """
+        msg = message.lower()
+        debt = ("欠", "要还", "到期", "还钱", "还款", "借我", "借给", "贷",
+                "提醒我", "提醒一下", "别忘了", "记得还", "年后还", "催")
+        if any(k in msg for k in debt):
+            return True
+        # 健康回访：明确不适词，或 头+痛/疼（容忍中间插入字）
+        health_exact = ("不舒服", "生病", "难受", "头痛", "头疼", "晕")
+        if any(k in msg for k in health_exact):
+            return True
+        if "头" in msg and any(p in msg for p in ("痛", "疼")):
+            return True
+        return False
+
+    @staticmethod
+    def _parse_due_date(due_date: str, advance_days) -> Optional[dict]:
+        """YYYY-MM-DD → epoch（当天 09:00）+ advance_days；解析失败返回 None。"""
+        if not due_date:
+            return None
+        try:
+            dt = datetime.datetime.strptime(due_date.strip(), "%Y-%m-%d")
+        except Exception:
+            return None
+        due_at = int(dt.replace(hour=9, minute=0).timestamp())
+        try:
+            adv = int(advance_days)
+        except Exception:
+            adv = 1
+        return {"due_at": due_at, "advance_days": adv}
+
+    async def _handle_reminder(self, user_id: str, message: str, context: list) -> str:
+        """提醒意图处理：退出回访优先 → AI 提取 → 落库 → 自然回复+确认。"""
+        # ① 身体好了 → 停止进行中的健康回访（风险点②退出路径）
+        if any(w in message for w in ("好了", "恢复了", "没事", "健康了", "不痛了")):
+            try:
+                active = await db.list_reminders(user_id, status="pending")
+                stopped = 0
+                for r in active:
+                    if r.get("repeat_interval_days"):
+                        await db.delete_reminder(user_id, r["id"])
+                        stopped += 1
+                if stopped:
+                    return (f"太好了，已停止 {stopped} 个健康回访。\n"
+                            f"如果还有不适，随时跟我说，我再帮你安排。")
+            except Exception as e:
+                log.warning("停止回访失败（忽略）: %s", e)
+
+        # ② AI 不可用：降级默认对话（无法提取日期，不强行创建）
+        if not client.available():
+            return await self._default_chat(message, context, user_id=user_id)
+
+        today = datetime.date.today().isoformat()
+        try:
+            info = await client.chat_json(
+                REMINDER_PROMPT, f"今天是{today}。用户说：{message}",
+                cache_ttl=3600, scenario="reminder",
+            )
+        except Exception as e:
+            log.warning("提醒提取失败（降级默认对话）: %s", e)
+            return await self._default_chat(message, context, user_id=user_id)
+        if not info or not isinstance(info, dict):
+            return await self._default_chat(message, context, user_id=user_id)
+
+        created: List[str] = []
+        if info.get("is_reminder"):
+            meta = self._parse_due_date(info.get("due_date"), info.get("advance_days"))
+            if meta:
+                await db.add_reminder(
+                    user_id, title=(info.get("title") or message)[:256],
+                    detail=info.get("detail") or "", due_at=meta["due_at"],
+                    advance_days=meta["advance_days"], source="chat")
+                created.append(
+                    f"📌 已记下「{info.get('title', '')}」，到期 {info.get('due_date', '')}，"
+                    f"提前 {meta['advance_days']} 天飞书提醒你。")
+        if info.get("is_followup"):
+            days = int(info.get("followup_days") or 1)
+            times = int(info.get("followup_times") or 3)
+            await db.add_reminder(
+                user_id, title=f"健康回访：{message[:64]}", detail="每日回访你的身体状态",
+                due_at=int(time.time()) + 86400, advance_days=0,
+                repeat_interval_days=days, repeat_times=times, source="chat")
+            created.append(
+                f"💊 已安排健康回访：未来约 {times} 次、每 {days} 天飞书问一次你的状态"
+                f"（你说'好了'我就停）。")
+
+        # ③ 自然回复（含建议）+ 提醒确认；同时沉淀一条事实便于日后引用
+        advice = await self._default_chat(message, context, user_id=user_id)
+        if created:
+            try:
+                await db.remember_fact(user_id, message[:24], message, category="提醒", source="chat")
+            except Exception:
+                pass
+            return advice + "\n\n" + "\n".join(created)
+        return advice
 
     # ===================== V2：多步编排 =====================
     async def _execute_multi_step(self, message: str, context: list, fact_block: str, user_id: str) -> str:
@@ -385,6 +509,10 @@ class AgentRouter:
             self.memory.add_short(user_id, message, response)
         elif decision["type"] == "multi_step":
             response = await self._execute_multi_step(message, context, fact_block, user_id)
+            yield response
+            self.memory.add_short(user_id, message, response)
+        elif decision["type"] == "reminder":
+            response = await self._handle_reminder(user_id, message, context)
             yield response
             self.memory.add_short(user_id, message, response)
         else:

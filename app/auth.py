@@ -37,6 +37,9 @@ _SESSION_FILE = os.path.join(DATA_DIR, "session_secret")
 
 VALID_TOKENS = set()  # 内存有效令牌集（重启清空 = 设计内）
 
+# TOTP 防重放：记已用动态码，时间窗内不可复用
+_used_otp: dict = {}
+
 _PLACEHOLDER = "****"
 _B32_ALPHABET = set(string.ascii_uppercase + string.digits + "=")
 
@@ -197,8 +200,16 @@ def setup_info() -> dict:
 
 
 def login(otp: str) -> dict | None:
-    if not verify_otp(otp or ""):
+    otp = otp or ""
+    now = time.time()
+    # 清理过期记录（时间窗外的码可复用）
+    for _c in [c for c, t in _used_otp.items() if t <= now]:
+        _used_otp.pop(_c, None)
+    if otp in _used_otp:
+        return None  # 时间窗内同码重放拒绝
+    if not verify_otp(otp):
         return None
+    _used_otp[otp] = now + 60  # 60 秒内同码不可二次登录
     mark_enrolled()
     return generate_token()
 

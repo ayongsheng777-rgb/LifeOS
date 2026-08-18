@@ -5,7 +5,9 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
 # 系统依赖（segno/lark 仅纯 Python，无需编译；保留 ca-certs）
-RUN apt-get update \
+# 国内构建走清华镜像源，直连 deb.debian.org 会卡死
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -13,7 +15,8 @@ WORKDIR /app
 
 # ---- 依赖层（先拷依赖再拷源码，命中缓存）----
 COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip && pip install -r /app/requirements.txt
+RUN pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    && pip install --no-cache-dir -r /app/requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # ---- 源码层 ----
 COPY app /app/app

@@ -33,3 +33,6 @@ frontend/dist/
 .idea/
 .vscode/
 .DS_Store
+
+# ===== 临时工作目录（构建日志/调试探针，非项目产物）=====
+tmp/

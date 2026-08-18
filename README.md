@@ -46,6 +46,24 @@ cp .env.example .env        # 按需填写（程序启动时会自动加载 .env
 uvicorn app.main:app --reload --host 0.0.0.0 --port 7208
 ```
 
+## 部署（Docker，推荐生产）
+
+整套服务（PostgreSQL / Redis / Qdrant / LifeOS API）由 `docker-compose.yml` 统一管理，组成 `lifeos` 项目树。
+
+```bash
+# 1. 准备 .env（含 LIFEOS_DB_PW 等，compose 用其插值）
+# 2. 构建并拉起全部服务
+docker compose -f docker-compose.yml --project-directory . up -d --build
+```
+
+- **数据层**：postgres 用命名卷 `lifeos_pgdata`；redis 用 `lifeos-redis-data`；qdrant 用 `lifeos_qdrant`（均为 `external` 命名卷，容器删除不丢数据）。
+- **API 容器**：`lifeos-api` 监听容器内 `0.0.0.0:8000`，宿主映射 `7208:8000`，访问地址不变（`http://127.0.0.1:7208`）。`app/`、`skills/`、`frontend/dist`、`data/` 均以 bind mount 挂载，改源码即时反映。
+- **开机自启**：四个容器均 `restart: always`，随 Docker Desktop 启动自动拉起，无需任何宿主计划任务。
+- **改代码热更新**：改 `app/` 或 `skills/` 后 `docker restart lifeos-api` 即生效；仅改 `requirements.txt` 依赖才需 `docker compose build --build`。
+- **桌面入口**：仓库 `scripts/LifeOS-启动.url` 为网址书签，双击直接用浏览器打开 `http://127.0.0.1:7208`。
+
+> 旧的「宿主 venv + uvicorn + 计划任务自启」方案已弃用（在带 HIPS 的主机上进程易被安全软件误杀）；如要回退，计划任务 `LifeOS-Backend` 仅被禁用，可重新启用，宿主启动脚本在 `scripts/start_backend.ps1`。
+
 ## 飞书接入
 
 - 方式 A（推荐）：前端调 `POST /api/feishu/qrcode` 拿 `scan_url`（指向 `accounts.feishu.cn` 官方页），用户扫码授权 → 轮询 `GET /api/feishu/qrcode/status` 拿到 `app_id/secret` 自动落库并热启动 Bot。
