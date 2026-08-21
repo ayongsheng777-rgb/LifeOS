@@ -48,6 +48,7 @@ class AIProfile:
     proxy: str = ""
     user_agent: str = ""
     tags: list = field(default_factory=list)
+    priority: int = 999   # 故障转移优先级：越小越先尝试（NVIDIA=1 / 硅基流动=2 / DeepSeek=3）
 
     @classmethod
     def from_dict(cls, d: dict) -> "AIProfile":
@@ -60,6 +61,7 @@ class AIProfile:
             proxy=d.get("proxy", ""),
             user_agent=d.get("user_agent", ""),
             tags=d.get("tags", []) or [],
+            priority=int(d.get("priority", 999)),
         )
 
     def has_key(self) -> bool:
@@ -100,7 +102,7 @@ class Settings:
     feishu_admin_users: list = field(default_factory=list)
 
     # ---- OTP ----
-    otp_issuer: str = "LifeOS"
+    otp_issuer: str = "丽素"
     otp_account: str = "admin@lifeos"
     otp_secret: str = ""
     session_secret: str = ""
@@ -351,6 +353,7 @@ class Settings:
             "api_url": entry.get("api_url", ""),
             "api_key": entry.get("api_key", ""),
             "method": (entry.get("method") or "GET").upper(),
+            "process_prompt": entry.get("process_prompt", ""),
             "enabled": bool(entry.get("enabled", True)),
         }
         skills = [s for s in self.api_skills if s.get("id") != sid]

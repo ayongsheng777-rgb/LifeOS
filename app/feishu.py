@@ -196,13 +196,9 @@ class FeishuBotService:
                 await self._cmd_ingest_news(open_id, raw, chat_id)
             return
 
-        # 帮助
+        # 帮助（动态列出所有可用技能及触发方式）
         if text in ("帮助", "help", "?"):
-            await self._send_card(chat_id, "LifeOS 使用帮助",
-                                  ["· 直接发消息：我会用 AI 回复",
-                                   "· 附带新闻链接：我会解读并收录为素材",
-                                   "· 发送「清空上下文」：重置本次对话记忆",
-                                   "· 管理员可配置飞书 / AI 模型"])
+            await self._send_card(chat_id, "丽素 使用帮助", self._build_help_lines())
             return
 
         # 新闻素材查询
@@ -210,10 +206,17 @@ class FeishuBotService:
             await self._send_news_list(chat_id)
             return
 
-        # 含 URL → 新闻摄入
-        if re.search(r"https?://\S+", raw):
-            await self._cmd_ingest_news(open_id, raw, chat_id)
-            return
+        # 含 URL：仅当消息本质是"甩个链接"才当新闻素材；
+        # 带明确指令/问题（请/帮我/安装/怎么…）的走正常 AI 对话，避免误判
+        urls = re.findall(r"https?://\S+", raw)
+        if urls:
+            rest = re.sub(r"https?://\S+", " ", raw)
+            rest = re.sub(r"^@\S+\s*", " ", rest)
+            rest = re.sub(r"\s+", " ", rest).strip().strip(" ，,。.!！?？")
+            has_intent = any(k in rest for k in ("请", "帮我", "安装", "怎么", "如何", "为什么", "是什么"))
+            if not has_intent:
+                await self._cmd_ingest_news(open_id, raw, chat_id)
+                return
 
         # ===== AI 自救 / 模型管理指令（纯程序，不依赖 AI 可用）=====
         if text_lower.startswith("/ai_fix") or text_lower.startswith("/nvidia"):
@@ -247,6 +250,35 @@ class FeishuBotService:
             reply = f"处理出错：{e}"
         if reply:
             await self._send_rich(chat_id, reply)
+
+    def _build_help_lines(self) -> list:
+        """动态生成帮助：基础用法 + 当前所有可用技能的触发方式。"""
+        lines = [
+            "**基础用法**",
+            "· 直接发消息：AI 回复",
+            "· 附带新闻链接：解读并收录为素材",
+            "· 发「清空上下文」：重置对话记忆",
+        ]
+        try:
+            skills = agent_router.skill_registry.get_available_skills()
+        except Exception:
+            skills = []
+        if skills:
+            lines.append("")
+            lines.append("**可调用技能（发关键词即触发）**")
+            for s in skills:
+                name = s.get("name") or "?"
+                kws = [k for k in (s.get("trigger_keywords") or []) if k][:3]
+                desc = (s.get("desc") or "").strip()
+                parts = [f"· **{name}**"]
+                if kws:
+                    parts.append("说「" + " / ".join(kws) + "」")
+                if desc:
+                    parts.append(desc[:36])
+                lines.append("　".join(parts))
+        lines.append("")
+        lines.append("· 管理员可配置飞书 / AI 模型")
+        return lines
 
     # ===== 新闻素材摄入 =====
     def _news_dedup_key(self, urls, text):
@@ -445,7 +477,7 @@ class FeishuBotService:
                     "msg_type": "interactive",
                     "card": {
                         "header": {"template": "blue",
-                                   "title": {"tag": "plain_text", "content": "LifeOS"}},
+                                   "title": {"tag": "plain_text", "content": "丽素"}},
                         "elements": [{"tag": "div",
                                       "text": {"tag": "lark_md", "content": text_md}}],
                     },

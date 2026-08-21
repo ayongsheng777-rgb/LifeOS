@@ -29,7 +29,7 @@ async def _loop() -> None:
         try:
             due = await due_reminders(advance_window=True)
             for r in due:
-                text = f"⏰ LifeOS 提醒：{r['title']}"
+                text = f"⏰ 丽素 提醒：{r['title']}"
                 if r.get("detail"):
                     text += f"\n{r['detail']}"
                 try:

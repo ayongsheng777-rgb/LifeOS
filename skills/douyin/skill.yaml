@@ -1,0 +1,10 @@
+name: 抖音
+description: 抖音公开数据（实时热榜 / 关键词搜索），基于 guaikei 聚合接口，免费需 Token。用法：① 抖音有什么热门（实时热榜）② 抖音热搜 ③ 搜一下 AI教程 的抖音视频。Token 用飞书发「安装 @user_7a394f02/guaikei-douyin-track-hot-topics，key 是 <Token>」配置。
+trigger_keywords:
+  - 抖音
+  - 抖音热搜
+  - 抖音热榜
+  - 抖音热门
+  - 热榜
+  - 热搜
+  - 短视频

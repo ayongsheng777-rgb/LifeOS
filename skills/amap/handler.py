@@ -1,7 +1,7 @@
 """高德地图完整技能包：地点搜索 / 地理编码 / 路线规划。
 
 - Key 取自 settings.api_skills 中 name=="高德地图" 的条目（UI 改 Key 立即生效）。
-- 意图识别：
+- 意图识别：优先 AI 理解（带多轮上下文 + 长期记忆），失败回退关键词分割：
   * 含「到 / → / 至 / | / 去」→ 路线规划（先地理编码两端，再驾车路径规划）
   * 含「坐标 / 经纬度」→ 地理编码（地名→经纬度）
   * 默认 → POI 关键词搜索
@@ -9,6 +9,8 @@
 """
 import httpx
 from urllib.parse import quote
+
+from app.ai import slots
 
 _BASE = "https://restapi.amap.com"
 # 直连高德，不继承任何 HTTP_PROXY/HTTPS_PROXY 环境变量
@@ -94,6 +96,22 @@ async def _route(origin_name: str, dest_name: str, key: str) -> str:
     return "\n".join(lines)
 
 
+async def _search(q: str, key: str) -> str:
+    url = f"{_BASE}/v3/place/text?keywords={quote(q)}&key={key}&extensions=base"
+    data, err = await _get_json(url)
+    if err:
+        return f"搜索失败：{err}"
+    if data.get("status") != "1":
+        return f"搜索失败：{data.get('info')}"
+    pois = data.get("pois", [])[:5]
+    if not pois:
+        return f"未找到与「{q}」相关的地点。"
+    lines = [f"🔍 {q} 相关地点："]
+    for p in pois:
+        lines.append(f"· {p.get('name')} — {p.get('address', '')}（{p.get('location', '')}）")
+    return "\n".join(lines)
+
+
 class SkillHandler:
     def __init__(self, metadata: dict):
         self.metadata = metadata
@@ -102,34 +120,38 @@ class SkillHandler:
         key = _get_key()
         if not key:
             return "（高德地图未配置 API Key：请在「设置→技能管理→API 技能」中填写高德 Key）"
+
+        # ① AI 理解意图（带多轮上下文 + 长期记忆）
+        slot = await slots.extract_amap_intent(message, context)
+        if slot is not None:
+            intent = (slot.get("intent") or "").strip().lower()
+            q = (slot.get("q") or "").strip()
+            frm = (slot.get("from") or "").strip()
+            to = (slot.get("to") or "").strip()
+            if intent == "route" and frm and to:
+                return await _route(frm, to, key)
+            if intent == "geocode" and q:
+                loc, err = await _geocode(q, key)
+                if err:
+                    return f"地理编码失败：{err}"
+                return f"📍 {q}\n坐标：{loc}"
+            if intent == "search" and q:
+                return await _search(q, key)
+
+        # ② AI 不可用 / 提取不全 → 回退原有关键词分割逻辑
         q = _extract_query(message, self.metadata.get("trigger_keywords", []))
         if not q:
             return ("请告诉我地点，例如：\n"
                     "· 高德 故宫（搜索景点）\n"
                     "· 高德 北京天安门 坐标（查经纬度）\n"
                     "· 高德 北京到上海（路线规划）")
-        # 1) 路线规划
         route = _split_route(q)
         if route:
             return await _route(route[0], route[1], key)
-        # 2) 地理编码（坐标 / 经纬度）
         if any(k in q for k in ("坐标", "经纬度")):
             name = q.replace("坐标", "").replace("经纬度", "").strip()
             loc, err = await _geocode(name, key)
             if err:
                 return f"地理编码失败：{err}"
             return f"📍 {name}\n坐标：{loc}"
-        # 3) 默认 POI 关键词搜索
-        url = f"{_BASE}/v3/place/text?keywords={quote(q)}&key={key}&extensions=base"
-        data, err = await _get_json(url)
-        if err:
-            return f"搜索失败：{err}"
-        if data.get("status") != "1":
-            return f"搜索失败：{data.get('info')}"
-        pois = data.get("pois", [])[:5]
-        if not pois:
-            return f"未找到与「{q}」相关的地点。"
-        lines = [f"🔍 {q} 相关地点："]
-        for p in pois:
-            lines.append(f"· {p.get('name')} — {p.get('address', '')}（{p.get('location', '')}）")
-        return "\n".join(lines)
+        return await _search(q, key)

@@ -30,6 +30,10 @@ services:
       - DB_URL=postgresql+asyncpg://lifeos:${LIFEOS_DB_PW:?LIFEOS_DB_PW must be set}@postgres:5432/lifeos
       # 前端 SPA 与 API 同源托管（FRONTEND_DIST 指向构建产物）
       - FRONTEND_DIST=/app/frontend/dist
+      # ===== 长期记忆 embedding（O-3）：从 .env 注入，未配置则留空不启用 =====
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-}
+      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL:-}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
     depends_on:
       - redis
       - qdrant
@@ -39,6 +43,10 @@ services:
       - ./skills:/app/skills
       - ./frontend/dist:/app/frontend/dist
       - ./data:/app/data
+      # SkillHub 技能（宿主机 ~/.workbuddy/skills）与 CLI（~/.skillhub）挂进容器：
+      # 让丽素能读到/安装 skillhub 技能、读写 key 配置（执行仍归 WorkBuddy）
+      - "C:/Users/anyong/.workbuddy/skills:/app/skillhub_skills"
+      - "C:/Users/anyong/.skillhub:/app/skillhub_cli"
     restart: always
 
   redis:

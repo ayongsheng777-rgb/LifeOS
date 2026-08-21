@@ -39,6 +39,8 @@ from app.skills.db_store import (PgStore, init_db, remember_fact, list_facts,
                                   delete_fact, add_reminder, list_reminders,
                                   delete_reminder, mark_reminder_done)
 from app.connector import connector
+from app.skillhub import (list_skillhub_skills, set_skill_config, install_skill,
+                          SKILLHUB_SKILLS_DIR)
 from app.backup import (run_backup_all, start_backup_scheduler, stop_backup_scheduler,
                       is_scheduler_running, list_backup_points, run_restore, VALID_COMPONENTS,
                       normalize_target)
@@ -192,7 +194,7 @@ async def lifespan(app: FastAPI):
     await stop_bot()
 
 
-app = FastAPI(title="Chufeng LifeOS", version="2.0", lifespan=lifespan)
+app = FastAPI(title="丽素 LifeOS", version="2.0", lifespan=lifespan)
 
 
 # ===== 鉴权中间件 =====
@@ -832,6 +834,10 @@ async def models_fetch(req: ModelFetchReq):
 
     便于用户「填好地址和 key → 一键拉取模型清单 → 选一个添加」。失败返回结构化 reason。
     """
+    if not ai_rate_limiter.allow(DEFAULT_USER):
+        return JSONResponse(status_code=429,
+                            content={"error": "请求过于频繁，请稍后再试", "code": "RATE_LIMITED"},
+                            headers={"Retry-After": "30"})
     base_url = (req.base_url or "").rstrip("/")
     if not base_url:
         return JSONResponse(status_code=400, content={"error": "base_url 不能为空"})
@@ -863,6 +869,10 @@ async def models_fetch(req: ModelFetchReq):
 @app.post("/api/models/speedtest")
 async def models_speedtest(req: ModelSpeedReq):
     """测速：对指定模型跑 N 轮，返回 TTFT/延迟/吞吐(tps)。"""
+    if not ai_rate_limiter.allow(DEFAULT_USER):
+        return JSONResponse(status_code=429,
+                            content={"error": "请求过于频繁，请稍后再试", "code": "RATE_LIMITED"},
+                            headers={"Retry-After": "30"})
     mp = _profile_from_req(req)
     if mp is None:
         return JSONResponse(status_code=400,
@@ -928,6 +938,7 @@ class ApiSkillReq(BaseModel):
     api_url: str = ""
     api_key: str = ""
     method: str = "GET"
+    process_prompt: str = ""
     enabled: bool = True
 
 
@@ -940,6 +951,17 @@ class SkillPackageReq(BaseModel):
 
 class SkillToggleReq(BaseModel):
     enabled: bool = True
+
+
+class SkillHubConfigReq(BaseModel):
+    slug: str
+    key_name: str
+    key_value: str
+
+
+class SkillHubInstallReq(BaseModel):
+    slug: str
+    namespace: str = ""
 
 
 @app.get("/api/skills")
@@ -985,6 +1007,19 @@ async def skills_mgmt_list():
                 "api_key_masked": mask_secret(s.get("api_key", "")),
                 "method": s.get("method", "GET"),
             })
+    # 合并 SkillHub 技能（挂载的 ~/.workbuddy/skills），type=skillhub 供前端展示
+    try:
+        for s in list_skillhub_skills():
+            items.append({
+                "name": s["name"], "desc": s["description"],
+                "trigger_keywords": [],
+                "type": "skillhub", "enabled": True,
+                "slug": s["slug"], "namespace": s["namespace"],
+                "configured": s["configured"],
+                "config_key_names": s["config_key_names"],
+            })
+    except Exception:
+        pass
     return {"skills": items, "skills_dir": os.path.abspath(os.environ.get("SKILLS_DIR", "skills"))}
 
 
@@ -1000,6 +1035,7 @@ async def api_skills_list():
             "api_url": s.get("api_url", ""),
             "api_key_masked": mask_secret(s.get("api_key", "")),
             "method": s.get("method", "GET"),
+            "process_prompt": s.get("process_prompt", ""),
             "enabled": s.get("enabled", True),
         })
     return {"api_skills": out}
@@ -1018,7 +1054,8 @@ async def api_skill_upsert(req: ApiSkillReq):
         settings.upsert_api_skill({
             "id": sid, "name": name, "description": req.description,
             "trigger_keywords": req.trigger_keywords, "api_url": req.api_url,
-            "api_key": req.api_key, "method": req.method, "enabled": req.enabled,
+            "api_key": req.api_key, "method": req.method,
+            "process_prompt": req.process_prompt, "enabled": req.enabled,
         })
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
@@ -1042,6 +1079,26 @@ async def api_skill_toggle(sid: str, req: SkillToggleReq):
     return {"ok": True, "id": sid, "enabled": req.enabled}
 
 
+# ===== SkillHub 技能（装 + 配 key；执行归 WorkBuddy）=====
+@app.get("/api/skillhub/skills")
+async def skillhub_skills_list():
+    return {"skills": list_skillhub_skills(), "skills_dir": SKILLHUB_SKILLS_DIR}
+
+
+@app.post("/api/skillhub/config")
+async def skillhub_config_set(req: SkillHubConfigReq):
+    try:
+        cfg = set_skill_config(req.slug, req.key_name, req.key_value)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    return {"ok": True, "slug": req.slug, "config": cfg}
+
+
+@app.post("/api/skillhub/install")
+async def skillhub_install(req: SkillHubInstallReq):
+    return install_skill(req.namespace, req.slug)
+
+
 @app.post("/api/skills/package")
 async def skill_package_create(req: SkillPackageReq):
     """写入一个完整技能包（skill.yaml + handler.py）并热加载。
@@ -1058,6 +1115,11 @@ async def skill_package_create(req: SkillPackageReq):
     if not code or "class SkillHandler" not in code:
         return JSONResponse(status_code=400,
                             content={"error": "handler_code 必须包含 class SkillHandler 定义"})
+    # O-4：写入前静态安全校验，拦截明显 RCE / 破坏性调用
+    from app.skills.api_skill import validate_handler_code
+    ok, reason = validate_handler_code(code)
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": reason})
     try:
         folder = write_skill_package(name, req.description, req.trigger_keywords, code)
     except Exception as e:
@@ -1296,6 +1358,10 @@ async def delete_reminder_api(rid: str):
 @app.post("/api/ai/nvidia-probe")
 async def nvidia_probe_api():
     """手动触发 NVIDIA 自动探测+切换（纯程序，不依赖 AI 可用）。"""
+    if not ai_rate_limiter.allow(DEFAULT_USER):
+        return JSONResponse(status_code=429,
+                            content={"error": "请求过于频繁，请稍后再试", "code": "RATE_LIMITED"},
+                            headers={"Retry-After": "30"})
     from app.ai.client import _failover_rescue
     switched = await _failover_rescue()
     return {"ok": bool(switched)}
@@ -1304,6 +1370,10 @@ async def nvidia_probe_api():
 @app.get("/api/ai/nvidia-models")
 async def nvidia_list_models_api():
     """查看 NVIDIA 当前可选免费模型列表（不切换）。"""
+    if not ai_rate_limiter.allow(DEFAULT_USER):
+        return JSONResponse(status_code=429,
+                            content={"error": "请求过于频繁，请稍后再试", "code": "RATE_LIMITED"},
+                            headers={"Retry-After": "30"})
     from app.ai.nvidia_probe import list_available_models
     key = None
     for m in settings.ai_models:

@@ -15,6 +15,7 @@ import os
 import re
 import time
 import datetime
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -28,7 +29,7 @@ from app.config import settings
 
 # 提醒意图提取（纯 JSON，系统给今天日期，避免模型瞎编）
 REMINDER_PROMPT = (
-    "你是 LifeOS 的提醒提取器。从用户的话里提取『未来要做/要回访』的事项，只输出 JSON：\n"
+    "你是丽素 的提醒提取器。从用户的话里提取『未来要做/要回访』的事项，只输出 JSON：\n"
     "{\"is_reminder\": true|false, \"title\": \"事项名\", \"detail\": \"细节(含金额/对象)\", "
     "\"due_date\": \"YYYY-MM-DD\", \"advance_days\": 提前几天提醒(整数,默认1),\n"
     " \"is_followup\": true|false, \"followup_days\": 回访间隔天数(默认1), "
@@ -91,6 +92,12 @@ class AgentRouter:
         if fact_reply is not None:
             self.memory.add_short(user_id, message, fact_reply)
             return fact_reply
+
+        # 1.6 技能安装请求（skillhub / 安装技能）：真正调 skillhub 安装（可顺带配 key）
+        if self._skill_install_keyword(message):
+            reply = await self._handle_skill_install(message)
+            self.memory.add_short(user_id, message, reply)
+            return reply
 
         # 2. 获取当前短期记忆（Redis 多轮历史）
         context = self.memory.get_short(user_id)
@@ -245,6 +252,65 @@ class AgentRouter:
         if "头" in msg and any(p in msg for p in ("痛", "疼")):
             return True
         return False
+
+    @staticmethod
+    def _skill_install_keyword(message: str) -> bool:
+        """零开销快路：识别『安装第三方技能/skill』请求，避免 AI 回『无法安装』。"""
+        m = message.lower()
+        if "skillhub" in m:
+            return True
+        has_skill_word = "技能" in m or "skill" in m or (re.search(r"@[\w-]+/[\w-]+", message) is not None)
+        has_install_word = "安装" in m or "装个" in m or "装一下" in m
+        return bool(has_skill_word and has_install_word)
+
+    @staticmethod
+    def _extract_skill_slug(message: str) -> str:
+        """从『安装 xxx』里尽力提取技能 slug（去掉 URL/常见词）。主要走 @ns/slug 格式。"""
+        rest = re.sub(r"https?://\S+", " ", message)
+        rest = re.sub(r"skillhub", " ", rest, flags=re.I)
+        rest = re.sub(r"@[\w-]+/[\w-]+", " ", rest)
+        rest = re.sub(r"(?:请根据|安装|装个|装一下|装|技能|skill)", " ", rest, flags=re.I)
+        rest = re.sub(r"[，。、！？:：,\s]+", " ", rest).strip()
+        parts = rest.split()
+        return parts[0] if parts else ""
+
+    async def _handle_skill_install(self, message: str) -> str:
+        """真正安装技能：解析『安装 @ns/slug』，可顺带『key 是 xxx』一并配 key。
+
+        安装走 subprocess，用线程池跑避免阻塞飞书主循环；幂等（已装则跳过）。
+        """
+        from app.skillhub import install_skill, set_skill_config
+
+        # 1) 提取 slug + namespace（优先 @ns/slug）
+        m = re.search(r"@([\w-]+)/([\w-]+)", message)
+        namespace = m.group(1) if m else ""
+        slug = m.group(2) if m else self._extract_skill_slug(message)
+        if not slug:
+            return ("没识别出要装哪个技能。请这样发：\n"
+                    "『安装 @命名空间/技能名』，例如 安装 @user_7a394f02/guaikei-douyin-track-hot-topics")
+
+        # 2) 提取 key 值（key/token/密钥 是/为/：xxx）
+        key_val = ""
+        km = re.search(r"(?:key|token|密钥)\s*[是为:：=]\s*([A-Za-z0-9_\-\.]+)", message, re.I)
+        if km:
+            key_val = km.group(1).strip()
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, install_skill, namespace, slug)
+
+        lines = [f"{'✅' if result.get('ok') else '❌'} {result.get('message')}"]
+
+        # 3) 顺带配 key（若消息里带了 key 值）
+        if key_val:
+            key_name = "GUAIKEI_API_TOKEN"
+            try:
+                await loop.run_in_executor(None, set_skill_config, slug, key_name, key_val)
+                lines.append(f"🔑 已写入配置：{key_name}")
+            except Exception as e:
+                lines.append(f"⚠️ key 写入失败：{e}")
+        elif result.get("ok"):
+            lines.append("提示：需要 key 的技能，可发『安装 @ns/slug，key 是 <值>』一并配置。")
+        return "\n".join(lines)
 
     @staticmethod
     def _parse_due_date(due_date: str, advance_days) -> Optional[dict]:
@@ -407,7 +473,8 @@ class AgentRouter:
             try:
                 vec = await client.embed(message)
                 if vec:
-                    hits = lm.search_similar(vec, limit=3, user_id=None)
+                    # 与写入命名空间一致（存储层统一用 "me"），让 user_id 隔离过滤真正生效
+                    hits = lm.search_similar(vec, limit=3, user_id="me")
                     if hits:
                         refs = "\n".join(f"- {h['payload'].get('text', '')}" for h in hits)
                         ctx_text = (ctx_text + "\n[长期经验参考]\n" + refs) if ctx_text else ("[长期经验参考]\n" + refs)
@@ -447,7 +514,8 @@ class AgentRouter:
             try:
                 vec = await client.embed(message)
                 if vec:
-                    hits = lm.search_similar(vec, limit=3, user_id=None)
+                    # 与写入命名空间一致（存储层统一用 "me"），让 user_id 隔离过滤真正生效
+                    hits = lm.search_similar(vec, limit=3, user_id="me")
                     if hits:
                         refs = "\n".join(f"- {h['payload'].get('text', '')}" for h in hits)
                         ctx_text = (ctx_text + "\n[长期经验参考]\n" + refs) if ctx_text else ("[长期经验参考]\n" + refs)

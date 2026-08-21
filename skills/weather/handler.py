@@ -2,10 +2,13 @@
 
 - 数据来自 Open-Meteo 公开接口（geocoding-api + api.open-meteo.com），无需任何 API Key。
 - 直连（trust_env=False），不继承系统/沙箱代理。
-- 流程：从用户消息提取城市名 → 地理编码 → 取实时 + 未来 3 天预报 → 中文格式化。
+- 流程：AI 理解提取地点（带多轮上下文 + 长期记忆）→ 回退字符串裁剪
+        → 地理编码（Open-Meteo 优先，高德兜底中文地名）→ 取实时 + 未来 3 天预报 → 中文格式化。
 """
 import httpx
 from urllib.parse import quote
+
+from app.ai import slots
 
 _GEO = "https://geocoding-api.open-meteo.com/v1/search"
 _FC = "https://api.open-meteo.com/v1/forecast"
@@ -57,6 +60,45 @@ async def _geocode(name: str):
     return (g["latitude"], g["longitude"], g.get("name"), g.get("country"), g.get("admin1")), None
 
 
+async def _amap_fallback(name: str):
+    """高德兜底：中文地名 → (lat, lon)。失败返回 (None, err)。"""
+    from app.config import settings
+    key = ""
+    for s in settings.api_skills:
+        if s.get("name") == "高德地图":
+            key = s.get("api_key", "")
+            break
+    if not key:
+        return None, "高德地图未配置 API Key"
+    url = f"https://restapi.amap.com/v3/geocode/geo?address={quote(name)}&key={key}"
+    async with httpx.AsyncClient(**_HTTP) as hc:
+        r = await hc.get(url)
+    if r.status_code != 200:
+        return None, f"高德 HTTP {r.status_code}"
+    data = r.json()
+    if data.get("status") != "1" or not data.get("geocodes"):
+        return None, f"找不到「{name}」这个地点"
+    loc = data["geocodes"][0].get("location", "")
+    if not loc or "," not in loc:
+        return None, f"找不到「{name}」这个地点"
+    lon, lat = loc.split(",", 1)
+    try:
+        return (float(lat), float(lon)), None
+    except ValueError:
+        return None, f"找不到「{name}」这个地点"
+
+
+async def _geocode_robust(name: str):
+    """Open-Meteo 优先，高德兜底（解决中文地名查不到）。返回 (geo_tuple, err)。"""
+    geo, err = await _geocode(name)
+    if not err:
+        return geo, None
+    lat_lon, err2 = await _amap_fallback(name)
+    if err2:
+        return None, f"找不到「{name}」这个地点"
+    return (lat_lon[0], lat_lon[1], name, "", ""), None
+
+
 async def _forecast(lat, lon):
     url = (
         f"{_FC}?latitude={lat}&longitude={lon}"
@@ -98,18 +140,41 @@ def _fmt(geo, fc) -> str:
     return "\n".join(lines)
 
 
+def _extract_city_value(v) -> str:
+    """把 AI 返回的 city 字段规整成字符串（防御模型乱输出 list/dict）。"""
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, list) and v:
+        return str(v[0]).strip()
+    return ""
+
+
 class SkillHandler:
     def __init__(self, metadata: dict):
         self.metadata = metadata
 
     async def execute(self, message: str, context: list, user_id: str = None) -> str:
-        city = _extract_city(message)
+        city = None
+        # ① AI 理解提取地点（带多轮上下文 + 长期记忆，越聊越懂）
+        slot = await slots.extract_weather_location(message, context)
+        if slot is not None:
+            has = str(slot.get("has_location", "")).lower() in ("true", "1", "yes", "是")
+            city = _extract_city_value(slot.get("city"))
+            if not city or not has:
+                # AI 明确判断没有地点 → 直接反问，不回退裁剪（避免把寒暄当城市）
+                return ("请告诉我城市，例如：\n"
+                        "· 天气 北京\n"
+                        "· 上海今天天气\n"
+                        "· 广州明天会下雨吗")
+        # ② AI 不可用 → 回退字符串裁剪
+        if not city:
+            city = _extract_city(message)
         if not city:
             return ("请告诉我城市，例如：\n"
                     "· 天气 北京\n"
                     "· 上海今天天气\n"
                     "· 广州明天会下雨吗")
-        geo, err = await _geocode(city)
+        geo, err = await _geocode_robust(city)
         if err:
             return f"地理编码失败：{err}"
         fc, err2 = await _forecast(geo[0], geo[1])

@@ -96,10 +96,11 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { api } from '../api.js'
 import SkillConfig from './SkillConfig.vue'
 
-const emit = defineEmits(['goto'])
+const router = useRouter()
 
 const cfg = ref(null)
 const status = ref(null)
@@ -119,7 +120,7 @@ function badgeCls(s) {
   return 'neutral'
 }
 
-function goto(tab) { emit('goto', tab) }
+function goto(tab) { router.push('/' + tab) }
 
 async function load() {
   loading.value = true

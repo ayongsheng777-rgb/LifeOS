@@ -56,7 +56,11 @@ def available() -> bool:
 
 # ===================== 候选模型（Failover 来源）=====================
 def _build_candidates(model_profile=None):
-    """按优先级组装候选模型：显式指定 → active → 模型库其余带有效 key 的。"""
+    """按优先级组装候选模型：显式指定 → active → 模型库其余带有效 key 的（再按 priority 升序）。
+
+    priority 越小越优先（缺省 999 排最后）。故障转移链路因此稳定为：
+    NVIDIA(1) → 硅基流动(2) → DeepSeek(3) → 其它。
+    """
     cands = []
     seen = set()
     if model_profile and getattr(model_profile, "api_key", ""):
@@ -66,12 +70,15 @@ def _build_candidates(model_profile=None):
     if active and active.id not in seen:
         cands.append(active)
         seen.add(active.id)
+    rest = []
     for m in settings.ai_models:
         if _is_valid_key(m.get("api_key", "")):
             p = AIProfile.from_dict(m)
             if p.id not in seen:
-                cands.append(p)
+                rest.append(p)
                 seen.add(p.id)
+    rest.sort(key=lambda p: getattr(p, "priority", 999))
+    cands.extend(rest)
     return cands
 
 
@@ -536,7 +543,7 @@ async def _failover_rescue(*, user_id: str = "me", scenario: str = "chat") -> bo
     try:
         await bot.push_to_users(
             settings.feishu_admin_users,
-            "⚠️ LifeOS AI 全部模型调用失败，正在启动纯程序自救...",
+            "⚠️ 丽素 AI 全部模型调用失败，正在启动纯程序自救...",
         )
     except Exception:
         pass  # 飞书也挂就跳过
